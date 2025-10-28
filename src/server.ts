@@ -13,11 +13,13 @@ const port = parseInt(process.env.SYSTEMX_PORT ?? "8080", 10);
 const host = process.env.SYSTEMX_HOST ?? "0.0.0.0";
 const heartbeatIntervalMs = parseInt(process.env.SYSTEMX_HEARTBEAT_INTERVAL ?? "30000", 10);
 const heartbeatTimeoutMs = parseInt(process.env.SYSTEMX_HEARTBEAT_TIMEOUT ?? "60000", 10);
+const callTimeoutMs = parseInt(process.env.SYSTEMX_CALL_TIMEOUT ?? "30000", 10);
 
 const router = new SystemXRouter({
   heartbeatIntervalMs,
   heartbeatTimeoutMs,
   logger,
+  callRingingTimeoutMs: callTimeoutMs,
 });
 
 function createTransport(ws: ServerWebSocket<SocketData>): MessageTransport {

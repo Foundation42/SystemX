@@ -4,6 +4,7 @@ import {
   HeartbeatMessage,
   HangupMessage,
   MsgMessage,
+  PresenceStatus,
   RegisterMessage,
   RouterInboundMessage,
   RouterOptions,
@@ -15,16 +16,21 @@ import { CallManager, CallState } from "./call";
 import { ConsoleLogger, Logger } from "./logger";
 import { isValidAddress } from "./utils";
 
+const VALID_STATUSES = new Set<PresenceStatus>(["available", "busy", "dnd", "away"]);
+
 export class SystemXRouter {
   private readonly connections = new ConnectionRegistry();
   private readonly calls = new CallManager();
   private readonly logger: Logger;
+  private readonly callTimeoutMs: number;
+  private readonly callTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private readonly options: RouterOptions) {
     if (!options) {
       throw new Error("Router options required");
     }
     this.logger = options.logger ?? new ConsoleLogger();
+    this.callTimeoutMs = options.callRingingTimeoutMs ?? 30_000;
   }
 
   createConnection(params: { id: string; transport: MessageTransport }): ConnectionContext {
@@ -58,6 +64,7 @@ export class SystemXRouter {
         this.handleMsg(connection, message);
         break;
       default:
+        this.sendInvalidPayload(connection, "UNKNOWN", `Unsupported message type: ${String((message as any).type)}`);
         break;
     }
   }
@@ -75,6 +82,10 @@ export class SystemXRouter {
   }
 
   private handleRegister(connection: ConnectionContext, message: RegisterMessage) {
+    if (typeof message.address !== "string") {
+      this.sendInvalidPayload(connection, "REGISTER", "Field 'address' must be a string");
+      return;
+    }
     if (!isValidAddress(message.address)) {
       this.logger.warn("Registration failed: invalid address", {
         attemptedAddress: message.address,
@@ -111,12 +122,24 @@ export class SystemXRouter {
   }
 
   private handleStatus(connection: ConnectionContext, message: StatusMessage) {
+    if (typeof message.status !== "string" || !VALID_STATUSES.has(message.status)) {
+      this.sendInvalidPayload(connection, "STATUS", `Invalid status value: ${String(message.status)}`);
+      return;
+    }
     this.connections.setStatus(connection, message.status);
     this.logger.debug("Status updated", {
       address: connection.address,
       status: message.status,
     });
     if (message.auto_sleep) {
+      if (
+        typeof message.auto_sleep.idle_timeout_seconds !== "number" ||
+        message.auto_sleep.idle_timeout_seconds < 0 ||
+        typeof message.auto_sleep.wake_on_ring !== "boolean"
+      ) {
+        this.sendInvalidPayload(connection, "STATUS", "Invalid auto_sleep payload");
+        return;
+      }
       connection.autoSleep = {
         idleTimeoutSeconds: message.auto_sleep.idle_timeout_seconds,
         wakeOnRing: message.auto_sleep.wake_on_ring,
@@ -141,6 +164,10 @@ export class SystemXRouter {
   }
 
   private handleDial(connection: ConnectionContext, message: DialMessage) {
+    if (typeof message.to !== "string" || message.to.length === 0) {
+      this.sendInvalidPayload(connection, "DIAL", "Field 'to' is required");
+      return;
+    }
     const caller = connection;
     if (!caller.address) {
       return;
@@ -193,6 +220,30 @@ export class SystemXRouter {
       });
       return;
     }
+    if (callee.status === "away") {
+      this.logger.info("Dial failed: callee away", {
+        from: caller.address,
+        to: message.to,
+      });
+      caller.transport.send({
+        type: "BUSY",
+        to: message.to,
+        reason: "away",
+      });
+      return;
+    }
+    if (callee.status === "busy" && !callee.activeCallId) {
+      this.logger.info("Dial failed: callee set busy", {
+        from: caller.address,
+        to: message.to,
+      });
+      caller.transport.send({
+        type: "BUSY",
+        to: message.to,
+        reason: "busy",
+      });
+      return;
+    }
 
     const call = this.calls.createCall({
       caller,
@@ -208,6 +259,7 @@ export class SystemXRouter {
       from: caller.address,
       to: callee.address,
     });
+    this.scheduleCallTimeout(call.callId);
 
     callee.transport.send({
       type: "RING",
@@ -218,6 +270,10 @@ export class SystemXRouter {
   }
 
   private handleAnswer(connection: ConnectionContext, message: AnswerMessage) {
+    if (typeof message.call_id !== "string" || message.call_id.length === 0) {
+      this.sendInvalidPayload(connection, "ANSWER", "Field 'call_id' is required");
+      return;
+    }
     const call = this.calls.getCall(message.call_id);
     if (!call) {
       return;
@@ -226,6 +282,7 @@ export class SystemXRouter {
       return;
     }
     this.calls.setConnected(call.callId);
+    this.clearCallTimer(call.callId);
     call.caller.transport.send({
       type: "CONNECTED",
       call_id: call.callId,
@@ -239,6 +296,10 @@ export class SystemXRouter {
   }
 
   private handleHangup(connection: ConnectionContext, message: HangupMessage) {
+    if (typeof message.call_id !== "string" || message.call_id.length === 0) {
+      this.sendInvalidPayload(connection, "HANGUP", "Field 'call_id' is required");
+      return;
+    }
     const call = this.calls.getCall(message.call_id);
     if (!call) {
       return;
@@ -251,6 +312,7 @@ export class SystemXRouter {
     }
 
     const reason = message.reason ?? "normal";
+    this.clearCallTimer(call.callId);
     this.calls.endCall(call.callId, reason);
     const otherParty = connection === call.caller ? call.callee : call.caller;
     otherParty.transport.send({
@@ -267,6 +329,19 @@ export class SystemXRouter {
   }
 
   private handleMsg(connection: ConnectionContext, message: MsgMessage) {
+    if (typeof message.call_id !== "string" || message.call_id.length === 0) {
+      this.sendInvalidPayload(connection, "MSG", "Field 'call_id' is required");
+      return;
+    }
+    if (
+      message.content_type !== undefined &&
+      message.content_type !== "text" &&
+      message.content_type !== "json" &&
+      message.content_type !== "binary"
+    ) {
+      this.sendInvalidPayload(connection, "MSG", `Unsupported content_type: ${String(message.content_type)}`);
+      return;
+    }
     const call = this.calls.getCall(message.call_id);
     if (!call || call.state !== "connected") {
       return;
@@ -289,7 +364,65 @@ export class SystemXRouter {
     });
   }
 
+  private sendInvalidPayload(connection: ConnectionContext, context: string, detail: string) {
+    this.logger.warn("Invalid message payload", {
+      context,
+      detail,
+      address: connection.address,
+      sessionId: connection.sessionId,
+    });
+    connection.transport.send({
+      type: "ERROR",
+      reason: "invalid_payload",
+      context,
+      detail,
+    });
+  }
+
+  private scheduleCallTimeout(callId: string) {
+    this.clearCallTimer(callId);
+    const timer = setTimeout(() => {
+      this.handleCallTimeout(callId);
+    }, this.callTimeoutMs);
+    this.callTimers.set(callId, timer);
+  }
+
+  private clearCallTimer(callId: string) {
+    const timer = this.callTimers.get(callId);
+    if (timer) {
+      clearTimeout(timer);
+      this.callTimers.delete(callId);
+    }
+  }
+
+  private handleCallTimeout(callId: string) {
+    const call = this.calls.getCall(callId);
+    if (!call || call.state !== "ringing") {
+      return;
+    }
+
+    this.logger.info("Call timed out waiting for answer", {
+      callId,
+      from: call.caller.address,
+      to: call.callee.address,
+    });
+    call.caller.transport.send({
+      type: "BUSY",
+      to: call.callee.address,
+      reason: "timeout",
+    });
+    call.callee.transport.send({
+      type: "HANGUP",
+      call_id: call.callId,
+      reason: "timeout",
+    });
+    this.clearCallTimer(callId);
+    this.calls.endCall(callId, "timeout");
+    this.clearCallState(call);
+  }
+
   private clearCallState(call: CallState) {
+    this.clearCallTimer(call.callId);
     if (call.caller.activeCallId === call.callId) {
       call.caller.activeCallId = undefined;
       call.caller.status = "available";
@@ -317,6 +450,7 @@ export class SystemXRouter {
           call_id: call.callId,
           reason,
         });
+        this.clearCallTimer(call.callId);
         this.calls.endCall(call.callId, reason);
         this.clearCallState(call);
       }

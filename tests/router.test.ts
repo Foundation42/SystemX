@@ -27,6 +27,7 @@ const defaultOptions: RouterOptions = {
   heartbeatIntervalMs: 10_000,
   heartbeatTimeoutMs: 30_000,
   logger: createSilentLogger(),
+  callRingingTimeoutMs: 5_000,
 };
 
 function createSilentLogger(): Logger {
@@ -247,6 +248,150 @@ describe("SystemXRouter call routing", () => {
       type: "BUSY",
       to: "callee@example.com",
       reason: "already_in_call",
+    });
+  });
+
+  it("declines calls when callee sets DND status", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "callee@example.com");
+
+    router.handleMessage(callee.connection, {
+      type: "STATUS",
+      status: "dnd",
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "callee@example.com",
+    });
+
+    const busyMessages = caller.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({
+      type: "BUSY",
+      reason: "dnd",
+    });
+  });
+
+  it("declines calls when callee marks status as away", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "callee@example.com");
+
+    router.handleMessage(callee.connection, {
+      type: "STATUS",
+      status: "away",
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "callee@example.com",
+    });
+
+    const busyMessages = caller.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({
+      type: "BUSY",
+      reason: "away",
+    });
+  });
+
+  it("honours manual busy status", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "callee@example.com");
+
+    router.handleMessage(callee.connection, {
+      type: "STATUS",
+      status: "busy",
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "callee@example.com",
+    });
+
+    const busyMessages = caller.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({
+      type: "BUSY",
+      reason: "busy",
+    });
+  });
+
+  it("times out unanswered calls", async () => {
+    router = new SystemXRouter({
+      ...defaultOptions,
+      callRingingTimeoutMs: 50,
+    });
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "callee@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "callee@example.com",
+    });
+
+    await Bun.sleep(80);
+
+    const busyMessages = caller.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({
+      type: "BUSY",
+      reason: "timeout",
+    });
+
+    const hangups = callee.transport.getMessagesOfType("HANGUP");
+    expect(hangups).toHaveLength(1);
+    expect(hangups[0]).toMatchObject({
+      type: "HANGUP",
+      reason: "timeout",
+    });
+
+    expect(caller.connection.activeCallId).toBeUndefined();
+    expect(callee.connection.activeCallId).toBeUndefined();
+    expect(callee.connection.status).toBe("available");
+  });
+});
+
+describe("SystemXRouter validation", () => {
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    router = new SystemXRouter(defaultOptions);
+  });
+
+  it("responds with error when dial payload is missing 'to'", () => {
+    const { transport, connection } = createTestConnection(router);
+    registerAddress(router, connection, "alice@example.com");
+
+    router.handleMessage(connection, { type: "DIAL" } as any);
+
+    const errors = transport.getMessagesOfType("ERROR");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "ERROR",
+      reason: "invalid_payload",
+    });
+  });
+
+  it("rejects invalid status values", () => {
+    const { transport, connection } = createTestConnection(router);
+    registerAddress(router, connection, "alice@example.com");
+
+    router.handleMessage(connection, { type: "STATUS", status: "napping" as any });
+
+    const errors = transport.getMessagesOfType("ERROR");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "ERROR",
+      reason: "invalid_payload",
     });
   });
 });

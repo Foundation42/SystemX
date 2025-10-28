@@ -67,4 +67,5 @@ export type RouterOptions = {
   heartbeatIntervalMs: number;
   heartbeatTimeoutMs: number;
   logger?: Logger;
+  callRingingTimeoutMs?: number;
 };
