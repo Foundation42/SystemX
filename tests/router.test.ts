@@ -394,4 +394,38 @@ describe("SystemXRouter validation", () => {
       reason: "invalid_payload",
     });
   });
+
+  it("rejects unsupported MSG content types", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "callee@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "callee@example.com",
+    });
+    const ring = callee.transport.getMessagesOfType("RING")[0];
+    const callId = ring.call_id as string;
+
+    router.handleMessage(callee.connection, {
+      type: "ANSWER",
+      call_id: callId,
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "MSG",
+      call_id: callId,
+      data: "payload",
+      content_type: "xml" as any,
+    });
+
+    const errors = caller.transport.getMessagesOfType("ERROR");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "ERROR",
+      context: "MSG",
+      reason: "invalid_payload",
+    });
+  });
 });

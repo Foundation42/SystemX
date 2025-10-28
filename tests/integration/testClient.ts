@@ -64,6 +64,23 @@ export class IntegrationClient {
     });
   }
 
+  async waitForClose(timeoutMs = 2_000) {
+    if (this.ws.readyState === WebSocket.CLOSED) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Timed out waiting for close")), timeoutMs);
+      this.ws.addEventListener(
+        "close",
+        () => {
+          clearTimeout(timeout);
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  }
+
   send(message: Record<string, unknown>) {
     this.ws.send(JSON.stringify(message));
   }

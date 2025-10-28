@@ -56,7 +56,7 @@ async function createRegisteredClient(address: string) {
   return client;
 }
 
-async function startServer() {
+async function startServer(envOverrides: Record<string, string> = {}) {
   serverProcess = Bun.spawn({
     cmd: ["bun", "run", "src/server.ts"],
     stdout: "pipe",
@@ -66,6 +66,7 @@ async function startServer() {
       SYSTEMX_PORT: String(TEST_PORT),
       SYSTEMX_HOST: "127.0.0.1",
       SYSTEMX_LOG_LEVEL: "error",
+      ...envOverrides,
     },
   });
 
@@ -159,5 +160,81 @@ describe("SystemX router integration", () => {
     });
 
     caller.close();
+  });
+
+  it("enforces configured call timeout", async () => {
+    await stopServer();
+    await startServer({ SYSTEMX_CALL_TIMEOUT: "100" });
+
+    const caller = await createRegisteredClient("caller.timeout@example.com");
+    const callee = await createRegisteredClient("callee.timeout@example.com");
+
+    caller.send({ type: "DIAL", to: "callee.timeout@example.com" });
+
+    await callee.waitForType("RING");
+
+    const busy = await caller.waitForType("BUSY", 5_000);
+    expect(busy).toMatchObject({
+      type: "BUSY",
+      to: "callee.timeout@example.com",
+      reason: "timeout",
+    });
+
+    const hangup = await callee.waitForType("HANGUP", 1_000);
+    expect(hangup).toMatchObject({
+      type: "HANGUP",
+      reason: "timeout",
+    });
+
+    caller.close();
+    callee.close();
+
+    await stopServer();
+    await startServer();
+  });
+
+  it("closes connection on malformed JSON", async () => {
+    const rawSocket = new WebSocket(SERVER_URL);
+    await new Promise<void>((resolve, reject) => {
+      rawSocket.addEventListener("open", () => resolve(), { once: true });
+      rawSocket.addEventListener("error", (err) => reject(err), { once: true });
+    });
+
+    rawSocket.send("not-json");
+
+    await new Promise<void>((resolve, reject) => {
+      rawSocket.addEventListener(
+        "close",
+        (event) => {
+          expect(event.code).toBe(1003);
+          resolve();
+        },
+        { once: true },
+      );
+      setTimeout(() => reject(new Error("Expected server to close connection")), 1_000);
+    });
+  });
+
+  it("returns error for unsupported MSG content type", async () => {
+    const caller = await createRegisteredClient("caller.invalidmsg@example.com");
+    const callee = await createRegisteredClient("callee.invalidmsg@example.com");
+
+    caller.send({ type: "DIAL", to: "callee.invalidmsg@example.com" });
+    const ring = await callee.waitForType("RING");
+    const callId = ring.call_id as string;
+
+    callee.send({ type: "ANSWER", call_id: callId });
+    await caller.waitForType("CONNECTED");
+
+    caller.send({ type: "MSG", call_id: callId, data: "hi", content_type: "xml" });
+    const error = await caller.waitForType("ERROR");
+    expect(error).toMatchObject({
+      type: "ERROR",
+      reason: "invalid_payload",
+      context: "MSG",
+    });
+
+    caller.close();
+    callee.close();
   });
 });
