@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import {
   AnswerMessage,
   DialMessage,
@@ -11,14 +12,27 @@ import {
   RouterInboundMessage,
   RouterOptions,
   StatusMessage,
+  SleepAckMessage,
+  WakeMode,
+  WakeHandlerConfig,
   UnregisterMessage,
 } from "./types";
 import { ConnectionContext, ConnectionRegistry, MessageTransport } from "./connection";
 import { CallManager, CallState } from "./call";
 import { ConsoleLogger, Logger } from "./logger";
 import { isValidAddress } from "./utils";
+import { NoopWakeExecutor, WakeExecutor, WakeProfile } from "./wake";
 
 const VALID_STATUSES = new Set<PresenceStatus>(["available", "busy", "dnd", "away"]);
+
+type PendingWakeCall = {
+  callId: string;
+  caller: ConnectionContext;
+  calleeAddress: string;
+  metadata?: Record<string, unknown>;
+  wakeProfile: WakeProfile;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 export class SystemXRouter {
   private readonly connections = new ConnectionRegistry();
@@ -29,6 +43,10 @@ export class SystemXRouter {
   private readonly dialMaxAttempts: number;
   private readonly dialWindowMs: number;
   private readonly dialCounters = new Map<string, { count: number; windowStart: number }>();
+  private readonly wakeExecutor: WakeExecutor;
+  private readonly wakeProfiles = new Map<string, WakeProfile>();
+  private readonly pendingWakeCallsByAddress = new Map<string, PendingWakeCall[]>();
+  private readonly pendingWakeCallsById = new Map<string, PendingWakeCall>();
 
   constructor(private readonly options: RouterOptions) {
     if (!options) {
@@ -38,6 +56,7 @@ export class SystemXRouter {
     this.callTimeoutMs = options.callRingingTimeoutMs ?? 30_000;
     this.dialMaxAttempts = options.dialRateLimit?.maxAttempts ?? 100;
     this.dialWindowMs = options.dialRateLimit?.windowMs ?? 60_000;
+    this.wakeExecutor = options.wakeExecutor ?? new NoopWakeExecutor(this.logger);
   }
 
   createConnection(params: { id: string; transport: MessageTransport }): ConnectionContext {
@@ -73,6 +92,9 @@ export class SystemXRouter {
       case "PRESENCE":
         this.handlePresence(connection, message);
         break;
+      case "SLEEP_ACK":
+        this.handleSleepAck(connection, message);
+        break;
       default:
         this.sendInvalidPayload(connection, "UNKNOWN", `Unsupported message type: ${String((message as any).type)}`);
         break;
@@ -107,6 +129,30 @@ export class SystemXRouter {
       return;
     }
 
+    let wakeMode: WakeMode | undefined;
+    let wakeHandler = connection.wakeHandler;
+    if (message.mode) {
+      if (message.mode !== "wake_on_ring") {
+        this.sendInvalidPayload(connection, "REGISTER", `Unsupported mode: ${message.mode}`);
+        return;
+      }
+      wakeMode = message.mode;
+      wakeHandler = this.validateWakeHandler(connection, message.wake_handler);
+      if (!wakeHandler) {
+        return;
+      }
+    } else if (message.wake_handler) {
+      this.sendInvalidPayload(connection, "REGISTER", "wake_handler requires mode 'wake_on_ring'");
+      return;
+    }
+
+    const storedProfile = this.wakeProfiles.get(message.address);
+    if (!wakeHandler && storedProfile) {
+      wakeMode = "wake_on_ring";
+      wakeHandler = storedProfile.handler;
+      this.wakeProfiles.delete(message.address);
+    }
+
     const result = this.connections.registerAddress(connection, message.address, message.metadata);
     if (!result.success) {
       this.logger.warn("Registration failed: address in use", {
@@ -120,6 +166,14 @@ export class SystemXRouter {
       return;
     }
 
+    if (wakeMode === "wake_on_ring" && wakeHandler) {
+      connection.wakeMode = wakeMode;
+      connection.wakeHandler = wakeHandler;
+    } else {
+      connection.wakeMode = undefined;
+      connection.wakeHandler = undefined;
+    }
+
     connection.transport.send({
       type: "REGISTERED",
       address: message.address,
@@ -129,6 +183,17 @@ export class SystemXRouter {
       address: message.address,
       sessionId: connection.sessionId,
     });
+
+    if (wakeMode === "wake_on_ring") {
+      this.logger.debug("Wake-on-ring profile active", {
+        address: message.address,
+        handlerType: wakeHandler?.type,
+      });
+    }
+
+    if (connection.address) {
+      this.resumePendingWakeCalls(connection);
+    }
   }
 
   private handleStatus(connection: ConnectionContext, message: StatusMessage) {
@@ -158,6 +223,9 @@ export class SystemXRouter {
   }
 
   private handleUnregister(connection: ConnectionContext, _message: UnregisterMessage) {
+    if (connection.wakeMode === "wake_on_ring" && connection.wakeHandler && connection.address) {
+      this.storeWakeProfile(connection);
+    }
     this.disconnect(connection, "client_requested");
   }
 
@@ -187,6 +255,9 @@ export class SystemXRouter {
     }
     const callee = this.connections.getByAddress(message.to);
     if (!callee) {
+      if (this.tryWakeSleepingAgent(caller, message)) {
+        return;
+      }
       this.logger.info("Dial failed: no such address", {
         from: caller.address,
         to: message.to,
@@ -258,28 +329,40 @@ export class SystemXRouter {
       return;
     }
 
+    this.startCall({ caller, callee, metadata: message.metadata });
+  }
+
+  private startCall(params: {
+    caller: ConnectionContext;
+    callee: ConnectionContext;
+    metadata?: Record<string, unknown>;
+    callId?: string;
+  }) {
     const call = this.calls.createCall({
-      caller,
-      callee,
-      metadata: message.metadata,
+      caller: params.caller,
+      callee: params.callee,
+      metadata: params.metadata,
+      callId: params.callId,
     });
-    caller.activeCallId = call.callId;
-    caller.status = "busy";
-    callee.activeCallId = call.callId;
-    callee.status = "busy";
+    params.caller.activeCallId = call.callId;
+    params.caller.status = "busy";
+    params.callee.activeCallId = call.callId;
+    params.callee.status = "busy";
     this.logger.info("Call initiated", {
       callId: call.callId,
-      from: caller.address,
-      to: callee.address,
+      from: params.caller.address,
+      to: params.callee.address,
     });
     this.scheduleCallTimeout(call.callId);
 
-    callee.transport.send({
+    params.callee.transport.send({
       type: "RING",
-      from: caller.address,
+      from: params.caller.address,
       call_id: call.callId,
-      metadata: message.metadata,
+      metadata: params.metadata,
     });
+
+    return call;
   }
 
   private handleAnswer(connection: ConnectionContext, message: AnswerMessage) {
@@ -435,6 +518,19 @@ export class SystemXRouter {
     });
   }
 
+  private handleSleepAck(connection: ConnectionContext, _message: SleepAckMessage) {
+    if (!connection.address) {
+      this.sendInvalidPayload(connection, "SLEEP_ACK", "Registration required before sleeping");
+      return;
+    }
+    if (connection.wakeMode !== "wake_on_ring" || !connection.wakeHandler) {
+      this.sendInvalidPayload(connection, "SLEEP_ACK", "Wake-on-ring mode must be configured before sleeping");
+      return;
+    }
+    this.storeWakeProfile(connection);
+    this.disconnect(connection, "sleep");
+  }
+
   private matchesPresenceQuery(connection: ConnectionContext, query: PresenceQuery): boolean {
     if (!connection.address) {
       return false;
@@ -491,6 +587,169 @@ export class SystemXRouter {
       Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
+  }
+
+  private validateWakeHandler(connection: ConnectionContext, handler?: WakeHandlerConfig): WakeHandlerConfig | undefined {
+    if (!handler) {
+      this.sendInvalidPayload(connection, "REGISTER", "wake_handler is required for wake_on_ring mode");
+      return undefined;
+    }
+    if (typeof handler.timeout_seconds !== "number" || handler.timeout_seconds <= 0) {
+      this.sendInvalidPayload(connection, "REGISTER", "wake_handler.timeout_seconds must be positive");
+      return undefined;
+    }
+    if (handler.type === "webhook") {
+      if (typeof handler.url !== "string" || handler.url.length === 0) {
+        this.sendInvalidPayload(connection, "REGISTER", "wake_handler.url must be a non-empty string");
+        return undefined;
+      }
+    } else if (handler.type === "spawn") {
+      if (!Array.isArray(handler.command) || handler.command.length === 0) {
+        this.sendInvalidPayload(connection, "REGISTER", "wake_handler.command must be a non-empty array");
+        return undefined;
+      }
+      if (!handler.command.every((part) => typeof part === "string" && part.length > 0)) {
+        this.sendInvalidPayload(connection, "REGISTER", "wake_handler.command entries must be non-empty strings");
+        return undefined;
+      }
+    } else {
+      this.sendInvalidPayload(connection, "REGISTER", `Unsupported wake handler type: ${String((handler as any).type)}`);
+      return undefined;
+    }
+    return handler;
+  }
+
+  private storeWakeProfile(connection: ConnectionContext) {
+    if (!connection.address || !connection.wakeHandler) {
+      return;
+    }
+    const profile: WakeProfile = {
+      address: connection.address,
+      handler: connection.wakeHandler,
+    };
+    this.wakeProfiles.set(connection.address, profile);
+    this.logger.info("Stored wake profile", {
+      address: connection.address,
+      handlerType: connection.wakeHandler.type,
+    });
+  }
+
+  private tryWakeSleepingAgent(caller: ConnectionContext, message: DialMessage): boolean {
+    const profile = this.wakeProfiles.get(message.to);
+    if (!profile) {
+      return false;
+    }
+    const callId = randomUUID();
+    const timeoutMs = Math.max(profile.handler.timeout_seconds * 1000, 100);
+    const timer = setTimeout(() => {
+      this.failPendingWakeCall(callId, "timeout");
+    }, timeoutMs);
+    const pending: PendingWakeCall = {
+      callId,
+      caller,
+      calleeAddress: message.to,
+      metadata: message.metadata,
+      wakeProfile: profile,
+      timer,
+    };
+    const queue = this.pendingWakeCallsByAddress.get(message.to) ?? [];
+    queue.push(pending);
+    this.pendingWakeCallsByAddress.set(message.to, queue);
+    this.pendingWakeCallsById.set(callId, pending);
+    caller.activeCallId = callId;
+    caller.status = "busy";
+    this.logger.info("Wake-on-ring attempt started", {
+      callId,
+      caller: caller.address,
+      callee: message.to,
+      handlerType: profile.handler.type,
+      timeoutMs,
+    });
+    this.wakeExecutor
+      .wake(profile)
+      .catch((error) => {
+        this.logger.warn("Wake executor failed", {
+          address: profile.address,
+          error: (error as Error).message,
+        });
+        this.failPendingWakeCall(callId, "wake_failed");
+      });
+    return true;
+  }
+
+  private resumePendingWakeCalls(callee: ConnectionContext) {
+    if (!callee.address) {
+      return;
+    }
+    const queue = this.pendingWakeCallsByAddress.get(callee.address);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+    const pending = queue.shift()!;
+    this.pendingWakeCallsById.delete(pending.callId);
+    clearTimeout(pending.timer);
+    if (queue.length === 0) {
+      this.pendingWakeCallsByAddress.delete(callee.address);
+    }
+    const callerStillConnected = this.connections.getBySession(pending.caller.sessionId);
+    if (!callerStillConnected) {
+      this.logger.warn("Caller disconnected before wake completion", {
+        callId: pending.callId,
+        callee: callee.address,
+      });
+      this.failPendingWakeCall(pending.callId, "caller_unavailable");
+      this.resumePendingWakeCalls(callee);
+      return;
+    }
+    this.startCall({
+      caller: pending.caller,
+      callee,
+      metadata: pending.metadata,
+      callId: pending.callId,
+    });
+  }
+
+  private failPendingWakeCall(callId: string, reason: string) {
+    const pending = this.pendingWakeCallsById.get(callId);
+    if (!pending) {
+      return;
+    }
+    this.pendingWakeCallsById.delete(callId);
+    const queue = this.pendingWakeCallsByAddress.get(pending.calleeAddress);
+    if (queue) {
+      const index = queue.findIndex((entry) => entry.callId === callId);
+      if (index >= 0) {
+        queue.splice(index, 1);
+      }
+      if (queue.length === 0) {
+        this.pendingWakeCallsByAddress.delete(pending.calleeAddress);
+      }
+    }
+    clearTimeout(pending.timer);
+    if (pending.caller.activeCallId === callId) {
+      pending.caller.activeCallId = undefined;
+      pending.caller.status = "available";
+    }
+    this.logger.warn("Pending wake call failed", {
+      callId,
+      caller: pending.caller.address,
+      callee: pending.calleeAddress,
+      reason,
+    });
+    pending.caller.transport.send({
+      type: "BUSY",
+      to: pending.calleeAddress,
+      reason,
+    });
+  }
+
+  private cancelPendingWakeCallsForCaller(connection: ConnectionContext, reason: string) {
+    const pendingIds = Array.from(this.pendingWakeCallsById.values())
+      .filter((pending) => pending.caller === connection)
+      .map((pending) => pending.callId);
+    for (const callId of pendingIds) {
+      this.failPendingWakeCall(callId, reason);
+    }
   }
 
   private sendInvalidPayload(connection: ConnectionContext, context: string, detail: string) {
@@ -610,10 +869,16 @@ export class SystemXRouter {
       call.callee.activeCallId = undefined;
       call.callee.status = "available";
     }
+    if (call.callee.address) {
+      this.resumePendingWakeCalls(call.callee);
+    }
     this.calls.release(call.callId);
   }
 
   disconnect(connection: ConnectionContext, reason: string) {
+    if (reason === "timeout" && connection.wakeMode === "wake_on_ring" && connection.wakeHandler && connection.address) {
+      this.storeWakeProfile(connection);
+    }
     this.connections.disconnect(connection);
     this.dialCounters.delete(connection.sessionId);
     this.logger.info("Connection disconnected", {
@@ -635,6 +900,7 @@ export class SystemXRouter {
         this.clearCallState(call);
       }
     }
+    this.cancelPendingWakeCallsForCaller(connection, reason);
     connection.transport.close?.(4000, reason);
   }
 }

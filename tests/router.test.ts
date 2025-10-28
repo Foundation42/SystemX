@@ -3,6 +3,7 @@ import { SystemXRouter } from "../src/router";
 import { RouterOptions } from "../src/types";
 import type { Logger } from "../src/logger";
 import { randomUUID } from "crypto";
+import type { WakeExecutor, WakeProfile } from "../src/wake";
 
 type SentMessage = Record<string, any>;
 
@@ -20,6 +21,18 @@ class TestTransport {
 
   getMessagesOfType(type: string) {
     return this.sent.filter((msg) => msg.type === type);
+  }
+}
+
+class FakeWakeExecutor implements WakeExecutor {
+  public readonly invocations: WakeProfile[] = [];
+  public shouldFail = false;
+
+  async wake(profile: WakeProfile): Promise<void> {
+    this.invocations.push(profile);
+    if (this.shouldFail) {
+      throw new Error("wake failed");
+    }
   }
 }
 
@@ -557,5 +570,120 @@ describe("SystemXRouter presence", () => {
       reason: "not_registered",
       context: "PRESENCE",
     });
+  });
+});
+
+describe("SystemXRouter wake-on-ring", () => {
+  let wakeExecutor: FakeWakeExecutor;
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    wakeExecutor = new FakeWakeExecutor();
+    router = new SystemXRouter({
+      ...defaultOptions,
+      wakeExecutor,
+    });
+  });
+
+  function registerWakeAgent(connection: ReturnType<typeof createTestConnection>["connection"], address: string, handlerOverrides?: Partial<WakeProfile["handler"]>) {
+    const handler = {
+      type: "webhook" as const,
+      url: "https://wake.example.com/agent",
+      timeout_seconds: 0.1,
+      ...handlerOverrides,
+    };
+    router.handleMessage(connection, {
+      type: "REGISTER",
+      address,
+      mode: "wake_on_ring",
+      wake_handler: handler,
+    });
+  }
+
+  it("stores wake profile on sleep and resumes call when agent reconnects", async () => {
+    const sleeper = createTestConnection(router);
+    registerWakeAgent(sleeper.connection, "agent@sleep.com");
+
+    router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
+    expect(sleeper.transport.closed).toEqual({ code: 4000, reason: "sleep" });
+
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "agent@sleep.com",
+      metadata: { subject: "wake test" },
+    });
+
+    expect(wakeExecutor.invocations).toHaveLength(1);
+    expect(wakeExecutor.invocations[0].address).toBe("agent@sleep.com");
+
+    const woken = createTestConnection(router);
+    router.handleMessage(woken.connection, {
+      type: "REGISTER",
+      address: "agent@sleep.com",
+    });
+
+    const ringMessages = woken.transport.getMessagesOfType("RING");
+    expect(ringMessages).toHaveLength(1);
+    const ring = ringMessages[0];
+    const callId = ring.call_id as string;
+
+    router.handleMessage(woken.connection, {
+      type: "ANSWER",
+      call_id: callId,
+    });
+
+    const connected = caller.transport.getMessagesOfType("CONNECTED");
+    expect(connected).toHaveLength(1);
+    expect(connected[0]).toMatchObject({ call_id: callId });
+
+    router.handleMessage(caller.connection, {
+      type: "HANGUP",
+      call_id: callId,
+    });
+  });
+
+  it("signals busy when wake executor fails", async () => {
+    wakeExecutor.shouldFail = true;
+
+    const sleeper = createTestConnection(router);
+    registerWakeAgent(sleeper.connection, "agent@fail.com");
+    router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
+
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "agent@fail.com",
+    });
+
+    await Bun.sleep(10);
+    const busy = caller.transport.getMessagesOfType("BUSY");
+    expect(busy).toHaveLength(1);
+    expect(busy[0]).toMatchObject({ reason: "wake_failed" });
+  });
+
+  it("times out wake attempts when agent does not reconnect", async () => {
+    const sleeper = createTestConnection(router);
+    registerWakeAgent(sleeper.connection, "agent@timeout.com", { timeout_seconds: 0.05 });
+    router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
+
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "agent@timeout.com",
+    });
+
+    await Bun.sleep(120);
+
+    const busy = caller.transport.getMessagesOfType("BUSY");
+    expect(busy).toHaveLength(1);
+    expect(busy[0]).toMatchObject({ reason: "timeout" });
+    expect(caller.connection.activeCallId).toBeUndefined();
   });
 });

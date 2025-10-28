@@ -19,8 +19,9 @@ export class CallManager {
     caller: ConnectionContext;
     callee: ConnectionContext;
     metadata?: Record<string, unknown>;
+    callId?: string;
   }): CallState {
-    const callId = randomUUID();
+    const callId = params.callId ?? randomUUID();
     const call: CallState = {
       callId,
       caller: params.caller,

@@ -2,11 +2,27 @@ import type { Logger } from "./logger";
 
 export type PresenceStatus = "available" | "busy" | "dnd" | "away";
 
+export type WakeMode = "wake_on_ring";
+
+export type WakeHandlerConfig =
+  | {
+      type: "webhook";
+      url: string;
+      timeout_seconds: number;
+    }
+  | {
+    type: "spawn";
+    command: string[];
+    timeout_seconds: number;
+  };
+
 export type RegisterMessage = {
   type: "REGISTER";
   address: string;
   auth?: string;
   metadata?: Record<string, unknown>;
+  mode?: WakeMode;
+  wake_handler?: WakeHandlerConfig;
 };
 
 export type StatusMessage = {
@@ -65,6 +81,10 @@ export type PresenceMessage = {
   query?: PresenceQuery;
 };
 
+export type SleepAckMessage = {
+  type: "SLEEP_ACK";
+};
+
 export type RouterInboundMessage =
   | RegisterMessage
   | StatusMessage
@@ -75,6 +95,7 @@ export type RouterInboundMessage =
   | HangupMessage
   | MsgMessage
   | PresenceMessage
+  | SleepAckMessage
   | Record<string, unknown>;
 
 export type RegisterFailureReason = "address_in_use" | "invalid_address" | "auth_failed";
@@ -88,4 +109,5 @@ export type RouterOptions = {
     maxAttempts: number;
     windowMs: number;
   };
+  wakeExecutor?: import("./wake").WakeExecutor;
 };

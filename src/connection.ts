@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { PresenceStatus, RegisterFailureReason } from "./types";
+import { PresenceStatus, RegisterFailureReason, WakeHandlerConfig, WakeMode } from "./types";
 
 export interface MessageTransport {
   send(message: Record<string, unknown>): void;
@@ -19,6 +19,8 @@ export type ConnectionContext = {
     idleTimeoutSeconds: number;
     wakeOnRing: boolean;
   };
+  wakeMode?: WakeMode;
+  wakeHandler?: WakeHandlerConfig;
 };
 
 export type RegisterResult =
