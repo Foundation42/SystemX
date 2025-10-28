@@ -18,6 +18,11 @@ const callTimeoutMs = parseInt(process.env.SYSTEMX_CALL_TIMEOUT ?? "30000", 10);
 const dialMaxAttempts = parseInt(process.env.SYSTEMX_DIAL_MAX_ATTEMPTS ?? "10", 10);
 const dialWindowMs = parseInt(process.env.SYSTEMX_DIAL_WINDOW_MS ?? "60000", 10);
 
+// TLS configuration
+const tlsEnabled = process.env.TLS_ENABLED === "true";
+const tlsCertPath = process.env.TLS_CERT_PATH;
+const tlsKeyPath = process.env.TLS_KEY_PATH;
+
 const wakeExecutor = createWakeExecutor(logger);
 
 const router = new SystemXRouter({
@@ -73,7 +78,8 @@ function toJsonString(message: unknown): string | null {
   return null;
 }
 
-const server = Bun.serve<SocketData>({
+// Build server configuration with optional TLS
+const serverConfig: Parameters<typeof Bun.serve<SocketData>>[0] = {
   hostname: host,
   port,
   fetch(request, server) {
@@ -131,11 +137,24 @@ const server = Bun.serve<SocketData>({
       });
     },
   },
-});
+};
+
+// Add TLS configuration if enabled
+if (tlsEnabled && tlsCertPath && tlsKeyPath) {
+  serverConfig.tls = {
+    cert: Bun.file(tlsCertPath),
+    key: Bun.file(tlsKeyPath),
+  };
+  logger.info("TLS enabled", { certPath: tlsCertPath, keyPath: tlsKeyPath });
+}
+
+const server = Bun.serve<SocketData>(serverConfig);
 
 logger.info("SystemX server ready", {
   port: server.port,
   hostname: host,
+  protocol: tlsEnabled ? "wss" : "ws",
+  tls: tlsEnabled,
 });
 
 const pruneIntervalMs = Math.max(heartbeatIntervalMs, 5_000);

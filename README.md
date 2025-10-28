@@ -2,6 +2,17 @@
 
 A WebSocket communication router modelled after classic telephone exchanges. SystemX enables agents to register addresses, place calls, exchange messages, and hang up using a minimal JSON protocol.
 
+## Licensing
+
+This project uses a **dual licensing model**:
+
+- **Open Source (MIT)** for individuals, education, and community projects.
+- **Commercial License** for proprietary or revenue-generating use.
+
+If your organization uses this code in a product, service, or platform, please reach out to discuss a suitable commercial arrangement: **license@foundation42.org**
+
+See [LICENSE](LICENSE) and [LICENSE-MIT](LICENSE-MIT) for details.
+
 ## Quick Start
 
 ```bash
@@ -92,6 +103,19 @@ Override configuration via environment variables, e.g.:
 docker run --rm -p 8080:8080 \
   -e SYSTEMX_PORT=8080 \
   -e SYSTEMX_LOG_LEVEL=debug \
+  systemx
+```
+
+### TLS/SSL Support
+
+SystemX supports TLS for secure WebSocket connections (wss://). Mount your certificates and set the TLS environment variables:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v /etc/letsencrypt:/etc/letsencrypt:ro \
+  -e TLS_ENABLED=true \
+  -e TLS_CERT_PATH=/etc/letsencrypt/live/your-domain.com/fullchain.pem \
+  -e TLS_KEY_PATH=/etc/letsencrypt/live/your-domain.com/privkey.pem \
   systemx
 ```
 
