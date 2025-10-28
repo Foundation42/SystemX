@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { PresenceStatus, RegisterFailureReason, WakeHandlerConfig, WakeMode } from "./types";
+import { ConcurrencyMode, PresenceStatus, RegisterFailureReason, WakeHandlerConfig, WakeMode } from "./types";
 
 export interface MessageTransport {
   send(message: Record<string, unknown>): void;
@@ -14,7 +14,11 @@ export type ConnectionContext = {
   status: PresenceStatus;
   metadata?: Record<string, unknown>;
   lastHeartbeat: number;
-  activeCallId?: string;
+  concurrency: ConcurrencyMode;
+  maxListeners?: number;
+  maxSessions?: number;
+  poolSize?: number;
+  activeCallIds: Set<string>;
   autoSleep?: {
     idleTimeoutSeconds: number;
     wakeOnRing: boolean;
@@ -40,6 +44,8 @@ export class ConnectionRegistry {
       transport: params.transport,
       status: "available",
       lastHeartbeat: Date.now(),
+      concurrency: "single",
+      activeCallIds: new Set<string>(),
     };
     this.connectionsBySession.set(sessionId, connection);
     return connection;

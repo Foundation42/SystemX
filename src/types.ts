@@ -2,6 +2,8 @@ import type { Logger } from "./logger";
 
 export type PresenceStatus = "available" | "busy" | "dnd" | "away";
 
+export type ConcurrencyMode = "single" | "broadcast" | "parallel";
+
 export type WakeMode = "wake_on_ring";
 
 export type WakeHandlerConfig =
@@ -24,6 +26,10 @@ export type RegisterMessage = {
   metadata?: Record<string, unknown>;
   mode?: WakeMode;
   wake_handler?: WakeHandlerConfig;
+  concurrency?: ConcurrencyMode;
+  max_listeners?: number;
+  max_sessions?: number;
+  pool_size?: number;
 };
 
 export type StatusMessage = {

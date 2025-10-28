@@ -373,9 +373,64 @@ describe("SystemXRouter call routing", () => {
       reason: "timeout",
     });
 
-    expect(caller.connection.activeCallId).toBeUndefined();
-    expect(callee.connection.activeCallId).toBeUndefined();
+    expect(caller.connection.activeCallIds.size).toBe(0);
+    expect(callee.connection.activeCallIds.size).toBe(0);
     expect(callee.connection.status).toBe("available");
+  });
+
+  it("supports parallel sessions up to configured limit", () => {
+    router = new SystemXRouter(defaultOptions);
+    const callee = createTestConnection(router);
+    router.handleMessage(callee.connection, {
+      type: "REGISTER",
+      address: "bot@parallel.test",
+      concurrency: "parallel",
+      max_sessions: 2,
+    });
+
+    const caller1 = createTestConnection(router);
+    registerAddress(router, caller1.connection, "caller1@example.com");
+    const caller2 = createTestConnection(router);
+    registerAddress(router, caller2.connection, "caller2@example.com");
+    const caller3 = createTestConnection(router);
+    registerAddress(router, caller3.connection, "caller3@example.com");
+
+    router.handleMessage(caller1.connection, {
+      type: "DIAL",
+      to: "bot@parallel.test",
+    });
+    const ringMessages1 = callee.transport.getMessagesOfType("RING");
+    expect(ringMessages1).toHaveLength(1);
+    const callId1 = ringMessages1[0].call_id as string;
+    router.handleMessage(callee.connection, { type: "ANSWER", call_id: callId1 });
+    callee.transport.sent.length = 0;
+
+    router.handleMessage(caller2.connection, {
+      type: "DIAL",
+      to: "bot@parallel.test",
+    });
+    const ringMessages2 = callee.transport.getMessagesOfType("RING");
+    expect(ringMessages2).toHaveLength(1);
+    const callId2 = ringMessages2[0].call_id as string;
+    router.handleMessage(callee.connection, { type: "ANSWER", call_id: callId2 });
+    callee.transport.sent.length = 0;
+
+    router.handleMessage(caller3.connection, {
+      type: "DIAL",
+      to: "bot@parallel.test",
+    });
+    const busyMessages = caller3.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({ reason: "max_sessions_reached" });
+
+    router.handleMessage(caller1.connection, { type: "HANGUP", call_id: callId1 });
+
+    router.handleMessage(caller3.connection, {
+      type: "DIAL",
+      to: "bot@parallel.test",
+    });
+    const ringMessages3 = callee.transport.getMessagesOfType("RING");
+    expect(ringMessages3).toHaveLength(1);
   });
 });
 
@@ -689,7 +744,7 @@ describe("SystemXRouter wake-on-ring", () => {
     const busy = caller.transport.getMessagesOfType("BUSY");
     expect(busy).toHaveLength(1);
     expect(busy[0]).toMatchObject({ reason: "timeout" });
-    expect(caller.connection.activeCallId).toBeUndefined();
+    expect(caller.connection.activeCallIds.size).toBe(0);
   });
 });
 
@@ -722,5 +777,74 @@ describe("SystemXRouter auto sleep", () => {
     });
     await Bun.sleep(400);
     expect(agent.transport.closed).toEqual({ code: 4000, reason: "sleep" });
+  });
+});
+
+describe("SystemXRouter broadcast routing", () => {
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    router = new SystemXRouter(defaultOptions);
+  });
+
+  it("shares broadcast messages with multiple listeners", () => {
+    const broadcaster = createTestConnection(router);
+    router.handleMessage(broadcaster.connection, {
+      type: "REGISTER",
+      address: "clock@broadcast.test",
+      concurrency: "broadcast",
+      max_listeners: 2,
+    });
+
+    const listener1 = createTestConnection(router);
+    registerAddress(router, listener1.connection, "listener1@example.com");
+    const listener2 = createTestConnection(router);
+    registerAddress(router, listener2.connection, "listener2@example.com");
+    const listener3 = createTestConnection(router);
+    registerAddress(router, listener3.connection, "listener3@example.com");
+
+    router.handleMessage(listener1.connection, {
+      type: "DIAL",
+      to: "clock@broadcast.test",
+    });
+    const connect1 = listener1.transport.getMessagesOfType("CONNECTED");
+    expect(connect1).toHaveLength(1);
+    const callId = connect1[0].call_id as string;
+
+    router.handleMessage(listener2.connection, {
+      type: "DIAL",
+      to: "clock@broadcast.test",
+    });
+    const connect2 = listener2.transport.getMessagesOfType("CONNECTED");
+    expect(connect2).toHaveLength(1);
+    expect(connect2[0].call_id).toBe(callId);
+
+    router.handleMessage(listener3.connection, {
+      type: "DIAL",
+      to: "clock@broadcast.test",
+    });
+    const busy3 = listener3.transport.getMessagesOfType("BUSY");
+    expect(busy3).toHaveLength(1);
+    expect(busy3[0]).toMatchObject({ reason: "max_listeners_reached" });
+
+    router.handleMessage(broadcaster.connection, {
+      type: "MSG",
+      call_id: callId,
+      data: "The time is now",
+      content_type: "text",
+    });
+
+    const listener1Msgs = listener1.transport.getMessagesOfType("MSG");
+    const listener2Msgs = listener2.transport.getMessagesOfType("MSG");
+    expect(listener1Msgs[0]).toMatchObject({ data: "The time is now" });
+    expect(listener2Msgs[0]).toMatchObject({ data: "The time is now" });
+
+    router.handleMessage(listener1.connection, {
+      type: "HANGUP",
+      call_id: callId,
+    });
+
+    const broadcasterHangups = broadcaster.transport.getMessagesOfType("HANGUP");
+    expect(broadcasterHangups[broadcasterHangups.length - 1]).toMatchObject({ from: "listener1@example.com" });
   });
 });

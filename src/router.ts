@@ -13,6 +13,7 @@ import {
   RouterOptions,
   StatusMessage,
   SleepAckMessage,
+  ConcurrencyMode,
   WakeMode,
   WakeHandlerConfig,
   UnregisterMessage,
@@ -34,6 +35,14 @@ type PendingWakeCall = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+type BroadcastSession = {
+  callId: string;
+  broadcaster: ConnectionContext;
+  listeners: Map<string, ConnectionContext>;
+  active: boolean;
+  metadata?: Record<string, unknown>;
+};
+
 export class SystemXRouter {
   private readonly connections = new ConnectionRegistry();
   private readonly calls = new CallManager();
@@ -47,6 +56,8 @@ export class SystemXRouter {
   private readonly wakeProfiles = new Map<string, WakeProfile>();
   private readonly pendingWakeCallsByAddress = new Map<string, PendingWakeCall[]>();
   private readonly pendingWakeCallsById = new Map<string, PendingWakeCall>();
+  private readonly broadcastSessionsByAddress = new Map<string, BroadcastSession>();
+  private readonly broadcastSessionsByCallId = new Map<string, BroadcastSession>();
 
   constructor(private readonly options: RouterOptions) {
     if (!options) {
@@ -129,6 +140,36 @@ export class SystemXRouter {
       return;
     }
 
+    const concurrency = this.normalizeConcurrency(message.concurrency);
+    if (!concurrency) {
+      this.sendInvalidPayload(connection, "REGISTER", `Unsupported concurrency mode: ${String(message.concurrency)}`);
+      return;
+    }
+
+    const maxListeners = this.extractPositiveInteger(message.max_listeners);
+    if (maxListeners === null) {
+      this.sendInvalidPayload(connection, "REGISTER", "max_listeners must be a positive integer");
+      return;
+    }
+    const maxSessions = this.extractPositiveInteger(message.max_sessions);
+    if (maxSessions === null) {
+      this.sendInvalidPayload(connection, "REGISTER", "max_sessions must be a positive integer");
+      return;
+    }
+    const poolSize = this.extractPositiveInteger(message.pool_size);
+    if (poolSize === null) {
+      this.sendInvalidPayload(connection, "REGISTER", "pool_size must be a positive integer");
+      return;
+    }
+    if (concurrency !== "broadcast" && maxListeners !== undefined) {
+      this.sendInvalidPayload(connection, "REGISTER", "max_listeners is only valid for broadcast concurrency");
+      return;
+    }
+    if (concurrency !== "parallel" && maxSessions !== undefined) {
+      this.sendInvalidPayload(connection, "REGISTER", "max_sessions is only valid for parallel concurrency");
+      return;
+    }
+
     let wakeMode: WakeMode | undefined;
     let wakeHandler = connection.wakeHandler;
     if (message.mode) {
@@ -172,6 +213,23 @@ export class SystemXRouter {
     } else {
       connection.wakeMode = undefined;
       connection.wakeHandler = undefined;
+    }
+
+    connection.concurrency = concurrency;
+    connection.maxListeners = concurrency === "broadcast" ? maxListeners : undefined;
+    connection.maxSessions = concurrency === "parallel" ? maxSessions : undefined;
+    connection.poolSize = poolSize;
+    connection.activeCallIds.clear();
+
+    if (connection.address) {
+      const existingBroadcastSession = this.broadcastSessionsByAddress.get(connection.address);
+      if (existingBroadcastSession) {
+        if (concurrency !== "broadcast") {
+          this.terminateBroadcastSession(existingBroadcastSession, "reconfigured");
+        } else {
+          existingBroadcastSession.broadcaster = connection;
+        }
+      }
     }
 
     connection.transport.send({
@@ -284,18 +342,6 @@ export class SystemXRouter {
       });
       return;
     }
-    if (callee.activeCallId) {
-      this.logger.info("Dial failed: callee already in call", {
-        from: caller.address,
-        to: message.to,
-      });
-      caller.transport.send({
-        type: "BUSY",
-        to: message.to,
-        reason: "already_in_call",
-      });
-      return;
-    }
     if (callee.status === "dnd") {
       this.logger.info("Dial failed: callee in DND", {
         from: caller.address,
@@ -320,7 +366,7 @@ export class SystemXRouter {
       });
       return;
     }
-    if (callee.status === "busy" && !callee.activeCallId) {
+    if (callee.status === "busy" && callee.activeCallIds.size === 0) {
       this.logger.info("Dial failed: callee set busy", {
         from: caller.address,
         to: message.to,
@@ -331,6 +377,38 @@ export class SystemXRouter {
         reason: "busy",
       });
       return;
+    }
+
+    switch (callee.concurrency) {
+      case "broadcast":
+        this.handleBroadcastDial(caller, callee, message);
+        return;
+      case "parallel": {
+        if (callee.maxSessions !== undefined && callee.activeCallIds.size >= callee.maxSessions) {
+          caller.transport.send({
+            type: "BUSY",
+            to: message.to,
+            reason: "max_sessions_reached",
+          });
+          return;
+        }
+        break;
+      }
+      case "single":
+      default:
+        if (this.hasActiveCall(callee)) {
+          this.logger.info("Dial failed: callee already in call", {
+            from: caller.address,
+            to: message.to,
+          });
+          caller.transport.send({
+            type: "BUSY",
+            to: message.to,
+            reason: "already_in_call",
+          });
+          return;
+        }
+        break;
     }
 
     this.startCall({ caller, callee, metadata: message.metadata });
@@ -348,9 +426,9 @@ export class SystemXRouter {
       metadata: params.metadata,
       callId: params.callId,
     });
-    params.caller.activeCallId = call.callId;
+    this.addActiveCall(params.caller, call.callId);
     params.caller.status = "busy";
-    params.callee.activeCallId = call.callId;
+    this.addActiveCall(params.callee, call.callId);
     params.callee.status = "busy";
     this.logger.info("Call initiated", {
       callId: call.callId,
@@ -376,6 +454,10 @@ export class SystemXRouter {
     }
     const call = this.calls.getCall(message.call_id);
     if (!call) {
+      const broadcastSession = this.broadcastSessionsByCallId.get(message.call_id);
+      if (broadcastSession && broadcastSession.broadcaster === connection) {
+        broadcastSession.active = true;
+      }
       return;
     }
     if (call.callee !== connection) {
@@ -402,6 +484,15 @@ export class SystemXRouter {
     }
     const call = this.calls.getCall(message.call_id);
     if (!call) {
+      const session = this.broadcastSessionsByCallId.get(message.call_id);
+      if (session) {
+        const reason = message.reason ?? "normal";
+        if (session.broadcaster === connection) {
+          this.terminateBroadcastSession(session, reason);
+        } else {
+          this.removeBroadcastListener(session, connection, reason);
+        }
+      }
       return;
     }
     if (call.state === "ended") {
@@ -444,6 +535,34 @@ export class SystemXRouter {
     }
     const call = this.calls.getCall(message.call_id);
     if (!call || call.state !== "connected") {
+      const session = this.broadcastSessionsByCallId.get(message.call_id);
+      if (!session) {
+        return;
+      }
+      const payload = {
+        type: "MSG",
+        call_id: session.callId,
+        from: connection.address,
+        data: message.data,
+        content_type: message.content_type ?? "text",
+      } as Record<string, unknown>;
+      if (session.broadcaster === connection) {
+        for (const [, listener] of session.listeners) {
+          listener.transport.send(payload);
+        }
+        this.logger.debug("Broadcast message sent", {
+          callId: session.callId,
+          from: connection.address,
+          listeners: session.listeners.size,
+        });
+      } else if (session.listeners.has(connection.sessionId)) {
+        session.broadcaster.transport.send(payload);
+        this.logger.debug("Broadcast listener message", {
+          callId: session.callId,
+          from: connection.address,
+          broadcaster: session.broadcaster.address,
+        });
+      }
       return;
     }
     if (call.caller !== connection && call.callee !== connection) {
@@ -664,7 +783,7 @@ export class SystemXRouter {
     queue.push(pending);
     this.pendingWakeCallsByAddress.set(message.to, queue);
     this.pendingWakeCallsById.set(callId, pending);
-    caller.activeCallId = callId;
+    this.addActiveCall(caller, callId);
     caller.status = "busy";
     this.logger.info("Wake-on-ring attempt started", {
       callId,
@@ -683,6 +802,130 @@ export class SystemXRouter {
         this.failPendingWakeCall(callId, "wake_failed");
       });
     return true;
+  }
+
+  private getOrCreateBroadcastSession(broadcaster: ConnectionContext): BroadcastSession | null {
+    if (!broadcaster.address) {
+      return null;
+    }
+    let session = this.broadcastSessionsByAddress.get(broadcaster.address);
+    if (session) {
+      session.broadcaster = broadcaster;
+      return session;
+    }
+    const callId = randomUUID();
+    session = {
+      callId,
+      broadcaster,
+      listeners: new Map(),
+      active: true,
+    };
+    this.broadcastSessionsByAddress.set(broadcaster.address, session);
+    this.broadcastSessionsByCallId.set(callId, session);
+    this.addActiveCall(broadcaster, callId);
+    broadcaster.status = "busy";
+    return session;
+  }
+
+  private handleBroadcastDial(caller: ConnectionContext, callee: ConnectionContext, message: DialMessage) {
+    const session = this.getOrCreateBroadcastSession(callee);
+    if (!session) {
+      return;
+    }
+    if (callee.maxListeners !== undefined && session.listeners.size >= callee.maxListeners) {
+      caller.transport.send({
+        type: "BUSY",
+        to: callee.address,
+        reason: "max_listeners_reached",
+      });
+      return;
+    }
+    if (session.listeners.has(caller.sessionId)) {
+      caller.transport.send({
+        type: "CONNECTED",
+        call_id: session.callId,
+        to: callee.address,
+      });
+      return;
+    }
+
+    session.listeners.set(caller.sessionId, caller);
+    this.addActiveCall(caller, session.callId);
+    caller.status = "busy";
+
+    caller.transport.send({
+      type: "CONNECTED",
+      call_id: session.callId,
+      to: callee.address,
+    });
+
+    this.resetSleepTimer(caller);
+    this.resetSleepTimer(callee);
+
+    if (callee.address && caller.address) {
+      callee.transport.send({
+        type: "RING",
+        from: caller.address,
+        call_id: session.callId,
+        metadata: message.metadata,
+      });
+    }
+
+    this.logger.info("Broadcast listener connected", {
+      broadcaster: callee.address,
+      listener: caller.address,
+      callId: session.callId,
+      listeners: session.listeners.size,
+    });
+  }
+
+  private removeBroadcastListener(session: BroadcastSession, listener: ConnectionContext, reason: string) {
+    if (!session.listeners.delete(listener.sessionId)) {
+      return;
+    }
+    this.removeActiveCall(listener, session.callId);
+    if (!this.hasActiveCall(listener)) {
+      listener.status = "available";
+    }
+    listener.transport.send({
+      type: "HANGUP",
+      call_id: session.callId,
+      reason,
+    });
+    if (listener.address && session.broadcaster.address) {
+      session.broadcaster.transport.send({
+        type: "HANGUP",
+        call_id: session.callId,
+        from: listener.address,
+        reason,
+      });
+    }
+    if (session.listeners.size === 0) {
+      this.terminateBroadcastSession(session, reason);
+    }
+  }
+
+  private terminateBroadcastSession(session: BroadcastSession, reason: string) {
+    if (session.broadcaster.address) {
+      this.broadcastSessionsByAddress.delete(session.broadcaster.address);
+    }
+    this.broadcastSessionsByCallId.delete(session.callId);
+    for (const [, listener] of session.listeners) {
+      this.removeActiveCall(listener, session.callId);
+      listener.transport.send({
+        type: "HANGUP",
+        call_id: session.callId,
+        reason,
+      });
+      if (!this.hasActiveCall(listener)) {
+        listener.status = "available";
+      }
+    }
+    session.listeners.clear();
+    this.removeActiveCall(session.broadcaster, session.callId);
+    if (!this.hasActiveCall(session.broadcaster)) {
+      session.broadcaster.status = "available";
+    }
   }
 
   private resumePendingWakeCalls(callee: ConnectionContext) {
@@ -734,9 +977,11 @@ export class SystemXRouter {
       }
     }
     clearTimeout(pending.timer);
-    if (pending.caller.activeCallId === callId) {
-      pending.caller.activeCallId = undefined;
-      pending.caller.status = "available";
+    if (pending.caller.activeCallIds.has(callId)) {
+      this.removeActiveCall(pending.caller, callId);
+      if (!this.hasActiveCall(pending.caller)) {
+        pending.caller.status = "available";
+      }
     }
     this.logger.warn("Pending wake call failed", {
       callId,
@@ -758,6 +1003,38 @@ export class SystemXRouter {
     for (const callId of pendingIds) {
       this.failPendingWakeCall(callId, reason);
     }
+  }
+
+  private addActiveCall(connection: ConnectionContext, callId: string) {
+    connection.activeCallIds.add(callId);
+  }
+
+  private removeActiveCall(connection: ConnectionContext, callId: string) {
+    connection.activeCallIds.delete(callId);
+  }
+
+  private hasActiveCall(connection: ConnectionContext): boolean {
+    return connection.activeCallIds.size > 0;
+  }
+
+  private normalizeConcurrency(mode?: string | ConcurrencyMode): ConcurrencyMode | null {
+    if (!mode) {
+      return "single";
+    }
+    if (mode === "single" || mode === "broadcast" || mode === "parallel") {
+      return mode;
+    }
+    return null;
+  }
+
+  private extractPositiveInteger(value: unknown): number | undefined | null {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      return null;
+    }
+    return Math.floor(value);
   }
 
   private resetSleepTimer(connection: ConnectionContext) {
@@ -786,7 +1063,7 @@ export class SystemXRouter {
     if (!connection.address) {
       return;
     }
-    if (connection.activeCallId) {
+    if (this.hasActiveCall(connection)) {
       this.resetSleepTimer(connection);
       return;
     }
@@ -916,14 +1193,18 @@ export class SystemXRouter {
 
   private clearCallState(call: CallState) {
     this.clearCallTimer(call.callId);
-    if (call.caller.activeCallId === call.callId) {
-      call.caller.activeCallId = undefined;
-      call.caller.status = "available";
+    if (call.caller.activeCallIds.has(call.callId)) {
+      this.removeActiveCall(call.caller, call.callId);
+      if (!this.hasActiveCall(call.caller)) {
+        call.caller.status = "available";
+      }
       this.resetSleepTimer(call.caller);
     }
-    if (call.callee.activeCallId === call.callId) {
-      call.callee.activeCallId = undefined;
-      call.callee.status = "available";
+    if (call.callee.activeCallIds.has(call.callId)) {
+      this.removeActiveCall(call.callee, call.callId);
+      if (!this.hasActiveCall(call.callee)) {
+        call.callee.status = "available";
+      }
       this.resetSleepTimer(call.callee);
     }
     if (call.callee.address) {
@@ -944,8 +1225,9 @@ export class SystemXRouter {
       sessionId: connection.sessionId,
       reason,
     });
-    if (connection.activeCallId) {
-      const call = this.calls.getCall(connection.activeCallId);
+    const activeCallIds = Array.from(connection.activeCallIds);
+    for (const callId of activeCallIds) {
+      const call = this.calls.getCall(callId);
       if (call) {
         const other = call.caller === connection ? call.callee : call.caller;
         other.transport.send({
@@ -956,6 +1238,15 @@ export class SystemXRouter {
         this.clearCallTimer(call.callId);
         this.calls.endCall(call.callId, reason);
         this.clearCallState(call);
+        continue;
+      }
+      const broadcastSession = this.broadcastSessionsByCallId.get(callId);
+      if (broadcastSession) {
+        if (broadcastSession.broadcaster === connection) {
+          this.terminateBroadcastSession(broadcastSession, reason);
+        } else {
+          this.removeBroadcastListener(broadcastSession, connection, reason);
+        }
       }
     }
     this.cancelPendingWakeCallsForCaller(connection, reason);
