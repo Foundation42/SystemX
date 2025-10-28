@@ -17,6 +17,15 @@ bun run examples/simple-client.ts --address alice@example.com --dial bob@example
 
 The server listens on `SYSTEMX_HOST`/`SYSTEMX_PORT` (defaults: `0.0.0.0:8080`). See `.env.example` for configuration knobs.
 
+## Features
+
+- **Addressable Calls:** `REGISTER`, `DIAL`, `RING`, `ANSWER`, `MSG`, `HANGUP`, `BUSY`.
+- **Presence & Status:** dynamic status updates plus presence queries (`PRESENCE`).
+- **Wake-on-Ring & Auto-Sleep:** agents can hibernate with `SLEEP_ACK`, wake via webhooks/spawn handlers, and auto-sleep on idle.
+- **Concurrency Modes:** single-use, broadcast, or parallel sessions per address.
+- **Federation:** child PBXs register via `REGISTER_PBX`, forwarding calls across exchanges with `DIAL_FORWARD`.
+- **Rate Limiting & Timeouts:** configurable dial throttling and ring / idle timers.
+
 ## Development
 
 ```bash
@@ -45,7 +54,9 @@ All messages are JSON objects with a `type` field. Phase 1 supports:
 - Presence: `STATUS`
 - Liveness: `HEARTBEAT`, `HEARTBEAT_ACK`
 - Calls: `DIAL`, `RING`, `ANSWER`, `CONNECTED`, `MSG`, `HANGUP`, `BUSY`
-- Sleep/Wake: `SLEEP_ACK` (agent elects to sleep), `REGISTER` with `mode: "wake_on_ring"` and wake handler metadata
+- Sleep/Wake: `SLEEP_ACK`, `REGISTER` with `mode: "wake_on_ring"`, optional wake handlers
+- Federation: `REGISTER_PBX`, `DIAL_FORWARD`, and federated `RING`/`BUSY` relays
+- Concurrency: `concurrency: "single" | "broadcast" | "parallel"` with optional caps (`max_listeners`, `max_sessions`)
 
 Refer to `docs/SystemX.md` for exhaustive payload definitions and future phases.
 
@@ -64,6 +75,31 @@ SYSTEMX_DIAL_MAX_ATTEMPTS=10
 SYSTEMX_DIAL_WINDOW_MS=60000
 ```
 
+See `docs/RecipientTypes.md` for concurrency examples and `docs/FederatedTests.md` for federated routing scenarios.
+
+## Docker
+
+Build and run the router container:
+
+```bash
+docker build -t systemx .
+docker run --rm -p 8080:8080 systemx
+```
+
+Override configuration via environment variables, e.g.:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e SYSTEMX_PORT=8080 \
+  -e SYSTEMX_LOG_LEVEL=debug \
+  systemx
+```
+
 ## Testing Strategy
 
-The repository uses Bun's built-in `bun test`. Current coverage focuses on routing behaviour (registration, heartbeat acks, call flow, stale connection eviction). Extend with integration tests as more features land.
+The repository uses Bun's built-in `bun test`. Coverage spans unit and integration flows (wake-on-ring, concurrency modes, PBX federation).
+
+```bash
+bun test                           # run full suite
+bun test --test-name-pattern pbx   # target specific scenarios
+```
