@@ -9,11 +9,12 @@ export type WakeHandlerConfig =
       type: "webhook";
       url: string;
       timeout_seconds: number;
+      payload?: Record<string, unknown>;
     }
   | {
-    type: "spawn";
-    command: string[];
-    timeout_seconds: number;
+      type: "spawn";
+      command: string[];
+      timeout_seconds: number;
   };
 
 export type RegisterMessage = {

@@ -219,6 +219,9 @@ export class SystemXRouter {
         idleTimeoutSeconds: message.auto_sleep.idle_timeout_seconds,
         wakeOnRing: message.auto_sleep.wake_on_ring,
       };
+      this.resetSleepTimer(connection);
+    } else {
+      this.clearSleepTimer(connection);
     }
   }
 
@@ -235,6 +238,7 @@ export class SystemXRouter {
       address: connection.address,
       sessionId: connection.sessionId,
     });
+    this.resetSleepTimer(connection);
     connection.transport.send({
       type: "HEARTBEAT_ACK",
       timestamp: connection.lastHeartbeat,
@@ -603,6 +607,10 @@ export class SystemXRouter {
         this.sendInvalidPayload(connection, "REGISTER", "wake_handler.url must be a non-empty string");
         return undefined;
       }
+      if (handler.payload && typeof handler.payload !== "object") {
+        this.sendInvalidPayload(connection, "REGISTER", "wake_handler.payload must be an object");
+        return undefined;
+      }
     } else if (handler.type === "spawn") {
       if (!Array.isArray(handler.command) || handler.command.length === 0) {
         this.sendInvalidPayload(connection, "REGISTER", "wake_handler.command must be a non-empty array");
@@ -752,6 +760,53 @@ export class SystemXRouter {
     }
   }
 
+  private resetSleepTimer(connection: ConnectionContext) {
+    this.clearSleepTimer(connection);
+    if (!connection.autoSleep || !connection.autoSleep.wakeOnRing) {
+      return;
+    }
+    const timeoutMs = Math.max(connection.autoSleep.idleTimeoutSeconds * 1000, 100);
+    connection.sleepTimer = setTimeout(() => {
+      this.handleSleepTimer(connection);
+    }, timeoutMs);
+  }
+
+  private clearSleepTimer(connection: ConnectionContext) {
+    if (connection.sleepTimer) {
+      clearTimeout(connection.sleepTimer);
+      connection.sleepTimer = undefined;
+    }
+  }
+
+  private handleSleepTimer(connection: ConnectionContext) {
+    connection.sleepTimer = undefined;
+    if (connection.autoSleep?.wakeOnRing !== true) {
+      return;
+    }
+    if (!connection.address) {
+      return;
+    }
+    if (connection.activeCallId) {
+      this.resetSleepTimer(connection);
+      return;
+    }
+    const warningMs = Math.max(200, Math.min(connection.autoSleep.idleTimeoutSeconds * 1000, 5_000));
+    connection.transport.send({
+      type: "SLEEP_PENDING",
+      reason: "idle_timeout",
+      seconds_until_sleep: Math.floor(warningMs / 1000),
+    });
+    connection.sleepTimer = setTimeout(() => {
+      connection.sleepTimer = undefined;
+      this.logger.info("Auto-sleeping connection", {
+        address: connection.address,
+        sessionId: connection.sessionId,
+      });
+      this.storeWakeProfile(connection);
+      this.disconnect(connection, "sleep");
+    }, warningMs);
+  }
+
   private sendInvalidPayload(connection: ConnectionContext, context: string, detail: string) {
     this.logger.warn("Invalid message payload", {
       context,
@@ -864,10 +919,12 @@ export class SystemXRouter {
     if (call.caller.activeCallId === call.callId) {
       call.caller.activeCallId = undefined;
       call.caller.status = "available";
+      this.resetSleepTimer(call.caller);
     }
     if (call.callee.activeCallId === call.callId) {
       call.callee.activeCallId = undefined;
       call.callee.status = "available";
+      this.resetSleepTimer(call.callee);
     }
     if (call.callee.address) {
       this.resumePendingWakeCalls(call.callee);
@@ -876,6 +933,7 @@ export class SystemXRouter {
   }
 
   disconnect(connection: ConnectionContext, reason: string) {
+    this.clearSleepTimer(connection);
     if (reason === "timeout" && connection.wakeMode === "wake_on_ring" && connection.wakeHandler && connection.address) {
       this.storeWakeProfile(connection);
     }

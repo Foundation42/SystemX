@@ -21,6 +21,7 @@ export type ConnectionContext = {
   };
   wakeMode?: WakeMode;
   wakeHandler?: WakeHandlerConfig;
+  sleepTimer?: ReturnType<typeof setTimeout>;
 };
 
 export type RegisterResult =

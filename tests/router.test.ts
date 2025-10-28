@@ -573,6 +573,26 @@ describe("SystemXRouter presence", () => {
   });
 });
 
+function registerWakeAgent(
+  router: SystemXRouter,
+  connection: ReturnType<typeof createTestConnection>["connection"],
+  address: string,
+  handlerOverrides?: Partial<WakeProfile["handler"]>,
+) {
+  const handler = {
+    type: "webhook" as const,
+    url: "https://wake.example.com/agent",
+    timeout_seconds: 0.1,
+    ...handlerOverrides,
+  };
+  router.handleMessage(connection, {
+    type: "REGISTER",
+    address,
+    mode: "wake_on_ring",
+    wake_handler: handler,
+  });
+}
+
 describe("SystemXRouter wake-on-ring", () => {
   let wakeExecutor: FakeWakeExecutor;
   let router: SystemXRouter;
@@ -585,24 +605,9 @@ describe("SystemXRouter wake-on-ring", () => {
     });
   });
 
-  function registerWakeAgent(connection: ReturnType<typeof createTestConnection>["connection"], address: string, handlerOverrides?: Partial<WakeProfile["handler"]>) {
-    const handler = {
-      type: "webhook" as const,
-      url: "https://wake.example.com/agent",
-      timeout_seconds: 0.1,
-      ...handlerOverrides,
-    };
-    router.handleMessage(connection, {
-      type: "REGISTER",
-      address,
-      mode: "wake_on_ring",
-      wake_handler: handler,
-    });
-  }
-
   it("stores wake profile on sleep and resumes call when agent reconnects", async () => {
     const sleeper = createTestConnection(router);
-    registerWakeAgent(sleeper.connection, "agent@sleep.com");
+    registerWakeAgent(router, sleeper.connection, "agent@sleep.com");
 
     router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
     expect(sleeper.transport.closed).toEqual({ code: 4000, reason: "sleep" });
@@ -649,7 +654,7 @@ describe("SystemXRouter wake-on-ring", () => {
     wakeExecutor.shouldFail = true;
 
     const sleeper = createTestConnection(router);
-    registerWakeAgent(sleeper.connection, "agent@fail.com");
+    registerWakeAgent(router, sleeper.connection, "agent@fail.com");
     router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
 
     const caller = createTestConnection(router);
@@ -668,7 +673,7 @@ describe("SystemXRouter wake-on-ring", () => {
 
   it("times out wake attempts when agent does not reconnect", async () => {
     const sleeper = createTestConnection(router);
-    registerWakeAgent(sleeper.connection, "agent@timeout.com", { timeout_seconds: 0.05 });
+    registerWakeAgent(router, sleeper.connection, "agent@timeout.com", { timeout_seconds: 0.05 });
     router.handleMessage(sleeper.connection, { type: "SLEEP_ACK" });
 
     const caller = createTestConnection(router);
@@ -685,5 +690,37 @@ describe("SystemXRouter wake-on-ring", () => {
     expect(busy).toHaveLength(1);
     expect(busy[0]).toMatchObject({ reason: "timeout" });
     expect(caller.connection.activeCallId).toBeUndefined();
+  });
+});
+
+describe("SystemXRouter auto sleep", () => {
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    router = new SystemXRouter(defaultOptions);
+  });
+
+  it("sends sleep pending and auto sleeps after timeout", async () => {
+    const agent = createTestConnection(router);
+    registerWakeAgent(router, agent.connection, "agent@auto.com", { timeout_seconds: 0.2 });
+
+    router.handleMessage(agent.connection, {
+      type: "STATUS",
+      status: "available",
+      auto_sleep: {
+        idle_timeout_seconds: 0.05,
+        wake_on_ring: true,
+      },
+    });
+
+    await Bun.sleep(120);
+
+    const sleepPending = agent.transport.getMessagesOfType("SLEEP_PENDING");
+    expect(sleepPending).toHaveLength(1);
+    expect(sleepPending[0]).toMatchObject({
+      reason: "idle_timeout",
+    });
+    await Bun.sleep(400);
+    expect(agent.transport.closed).toEqual({ code: 4000, reason: "sleep" });
   });
 });

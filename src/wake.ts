@@ -49,6 +49,7 @@ export class DefaultWakeExecutor implements WakeExecutor {
         body: JSON.stringify({
           address: profile.address,
           handler: profile.handler,
+          payload: profile.handler.payload ?? null,
         }),
         signal: controller.signal,
       });
