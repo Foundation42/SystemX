@@ -428,4 +428,39 @@ describe("SystemXRouter validation", () => {
       reason: "invalid_payload",
     });
   });
+
+  it("rate limits excessive dial attempts", () => {
+    router = new SystemXRouter({
+      ...defaultOptions,
+      dialRateLimit: {
+        maxAttempts: 2,
+        windowMs: 1_000,
+      },
+    });
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@example.com");
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "missing@example.com",
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "missing@example.com",
+    });
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "missing@example.com",
+    });
+
+    const errors = caller.transport.getMessagesOfType("ERROR");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "ERROR",
+      reason: "rate_limited",
+      context: "DIAL",
+    });
+  });
 });

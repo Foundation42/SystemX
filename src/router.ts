@@ -24,6 +24,9 @@ export class SystemXRouter {
   private readonly logger: Logger;
   private readonly callTimeoutMs: number;
   private readonly callTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly dialMaxAttempts: number;
+  private readonly dialWindowMs: number;
+  private readonly dialCounters = new Map<string, { count: number; windowStart: number }>();
 
   constructor(private readonly options: RouterOptions) {
     if (!options) {
@@ -31,6 +34,8 @@ export class SystemXRouter {
     }
     this.logger = options.logger ?? new ConsoleLogger();
     this.callTimeoutMs = options.callRingingTimeoutMs ?? 30_000;
+    this.dialMaxAttempts = options.dialRateLimit?.maxAttempts ?? 100;
+    this.dialWindowMs = options.dialRateLimit?.windowMs ?? 60_000;
   }
 
   createConnection(params: { id: string; transport: MessageTransport }): ConnectionContext {
@@ -166,6 +171,9 @@ export class SystemXRouter {
   private handleDial(connection: ConnectionContext, message: DialMessage) {
     if (typeof message.to !== "string" || message.to.length === 0) {
       this.sendInvalidPayload(connection, "DIAL", "Field 'to' is required");
+      return;
+    }
+    if (this.isDialRateLimited(connection)) {
       return;
     }
     const caller = connection;
@@ -379,6 +387,40 @@ export class SystemXRouter {
     });
   }
 
+  private isDialRateLimited(connection: ConnectionContext): boolean {
+    if (this.dialMaxAttempts <= 0) {
+      return false;
+    }
+    const now = Date.now();
+    const entry = this.dialCounters.get(connection.sessionId);
+    if (!entry) {
+      this.dialCounters.set(connection.sessionId, { count: 1, windowStart: now });
+      return false;
+    }
+    if (now - entry.windowStart > this.dialWindowMs) {
+      entry.count = 1;
+      entry.windowStart = now;
+      return false;
+    }
+    entry.count += 1;
+    if (entry.count > this.dialMaxAttempts) {
+      this.logger.warn("Dial rate limit exceeded", {
+        address: connection.address,
+        sessionId: connection.sessionId,
+        count: entry.count,
+        windowMs: this.dialWindowMs,
+      });
+      connection.transport.send({
+        type: "ERROR",
+        reason: "rate_limited",
+        context: "DIAL",
+        detail: "Too many dial attempts",
+      });
+      return true;
+    }
+    return false;
+  }
+
   private scheduleCallTimeout(callId: string) {
     this.clearCallTimer(callId);
     const timer = setTimeout(() => {
@@ -436,6 +478,7 @@ export class SystemXRouter {
 
   disconnect(connection: ConnectionContext, reason: string) {
     this.connections.disconnect(connection);
+    this.dialCounters.delete(connection.sessionId);
     this.logger.info("Connection disconnected", {
       address: connection.address,
       sessionId: connection.sessionId,

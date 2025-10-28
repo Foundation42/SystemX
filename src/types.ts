@@ -68,4 +68,8 @@ export type RouterOptions = {
   heartbeatTimeoutMs: number;
   logger?: Logger;
   callRingingTimeoutMs?: number;
+  dialRateLimit?: {
+    maxAttempts: number;
+    windowMs: number;
+  };
 };

@@ -237,4 +237,31 @@ describe("SystemX router integration", () => {
     caller.close();
     callee.close();
   });
+
+  it("rate limits repeated dial attempts", async () => {
+    await stopServer();
+    await startServer({
+      SYSTEMX_DIAL_MAX_ATTEMPTS: "2",
+      SYSTEMX_DIAL_WINDOW_MS: "1000",
+    });
+
+    const caller = await createRegisteredClient("caller.ratelimit@example.com");
+
+    for (let i = 0; i < 3; i += 1) {
+      caller.send({ type: "DIAL", to: "nobody@example.com" });
+      await Bun.sleep(50);
+    }
+
+    const error = await caller.waitForType("ERROR", 2_000);
+    expect(error).toMatchObject({
+      type: "ERROR",
+      reason: "rate_limited",
+      context: "DIAL",
+    });
+
+    caller.close();
+
+    await stopServer();
+    await startServer();
+  });
 });
