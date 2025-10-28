@@ -4,6 +4,7 @@ import { logger } from "./logger";
 import type { RouterInboundMessage } from "./types";
 import type { ConnectionContext, MessageTransport } from "./connection";
 import type { ServerWebSocket } from "bun";
+import { createWakeExecutor } from "./wake";
 
 type SocketData = {
   connection: ConnectionContext | null;
@@ -17,6 +18,8 @@ const callTimeoutMs = parseInt(process.env.SYSTEMX_CALL_TIMEOUT ?? "30000", 10);
 const dialMaxAttempts = parseInt(process.env.SYSTEMX_DIAL_MAX_ATTEMPTS ?? "10", 10);
 const dialWindowMs = parseInt(process.env.SYSTEMX_DIAL_WINDOW_MS ?? "60000", 10);
 
+const wakeExecutor = createWakeExecutor(logger);
+
 const router = new SystemXRouter({
   heartbeatIntervalMs,
   heartbeatTimeoutMs,
@@ -26,6 +29,7 @@ const router = new SystemXRouter({
     maxAttempts: dialMaxAttempts,
     windowMs: dialWindowMs,
   },
+  wakeExecutor,
 });
 
 function createTransport(ws: ServerWebSocket<SocketData>): MessageTransport {

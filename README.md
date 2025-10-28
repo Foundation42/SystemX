@@ -45,6 +45,7 @@ All messages are JSON objects with a `type` field. Phase 1 supports:
 - Presence: `STATUS`
 - Liveness: `HEARTBEAT`, `HEARTBEAT_ACK`
 - Calls: `DIAL`, `RING`, `ANSWER`, `CONNECTED`, `MSG`, `HANGUP`, `BUSY`
+- Sleep/Wake: `SLEEP_ACK` (agent elects to sleep), `REGISTER` with `mode: "wake_on_ring"` and wake handler metadata
 
 Refer to `docs/SystemX.md` for exhaustive payload definitions and future phases.
 
