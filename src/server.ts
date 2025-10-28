@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { readFileSync } from "fs";
 import { SystemXRouter } from "./router";
 import { logger } from "./logger";
 import type { RouterInboundMessage } from "./types";
@@ -141,11 +142,20 @@ const serverConfig: Parameters<typeof Bun.serve<SocketData>>[0] = {
 
 // Add TLS configuration if enabled
 if (tlsEnabled && tlsCertPath && tlsKeyPath) {
-  serverConfig.tls = {
-    cert: Bun.file(tlsCertPath),
-    key: Bun.file(tlsKeyPath),
-  };
-  logger.info("TLS enabled", { certPath: tlsCertPath, keyPath: tlsKeyPath });
+  try {
+    serverConfig.tls = {
+      cert: readFileSync(tlsCertPath, "utf-8"),
+      key: readFileSync(tlsKeyPath, "utf-8"),
+    };
+    logger.info("TLS enabled", { certPath: tlsCertPath, keyPath: tlsKeyPath });
+  } catch (error) {
+    logger.error("Failed to load TLS certificates", {
+      error: (error as Error).message,
+      certPath: tlsCertPath,
+      keyPath: tlsKeyPath
+    });
+    throw error;
+  }
 }
 
 const server = Bun.serve<SocketData>(serverConfig);
