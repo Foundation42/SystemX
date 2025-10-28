@@ -143,14 +143,27 @@ const serverConfig: Parameters<typeof Bun.serve<SocketData>>[0] = {
 // Add TLS configuration if enabled
 if (tlsEnabled && tlsCertPath && tlsKeyPath) {
   try {
+    logger.info("Loading TLS certificates", { certPath: tlsCertPath, keyPath: tlsKeyPath });
+
+    const cert = readFileSync(tlsCertPath, "utf-8");
+    const key = readFileSync(tlsKeyPath, "utf-8");
+
+    logger.info("TLS certificates loaded", {
+      certLength: cert.length,
+      keyLength: key.length,
+      certPreview: cert.substring(0, 50) + "..."
+    });
+
     serverConfig.tls = {
-      cert: readFileSync(tlsCertPath, "utf-8"),
-      key: readFileSync(tlsKeyPath, "utf-8"),
+      cert,
+      key,
     };
-    logger.info("TLS enabled", { certPath: tlsCertPath, keyPath: tlsKeyPath });
+
+    logger.info("TLS configuration applied to server");
   } catch (error) {
     logger.error("Failed to load TLS certificates", {
       error: (error as Error).message,
+      stack: (error as Error).stack,
       certPath: tlsCertPath,
       keyPath: tlsKeyPath
     });
