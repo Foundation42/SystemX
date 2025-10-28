@@ -1,0 +1,17 @@
+{
+  "name": "systemx",
+  "version": "0.1.0",
+  "description": "SystemX WebSocket communication router",
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun run --watch src/server.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  }
+}
