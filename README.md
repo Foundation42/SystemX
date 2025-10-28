@@ -95,6 +95,16 @@ docker run --rm -p 8080:8080 \
   systemx
 ```
 
+### Docker Compose
+
+A simple compose file is provided:
+
+```bash
+docker compose up --build
+```
+
+This starts the `systemx` service on port `8080`. A template for spawning a child PBX is included (commented) to aid federation experiments; uncomment and adjust the environment/routes as needed.
+
 ## Testing Strategy
 
 The repository uses Bun's built-in `bun test`. Coverage spans unit and integration flows (wake-on-ring, concurrency modes, PBX federation).

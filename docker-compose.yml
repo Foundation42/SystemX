@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  systemx:
+    build: .
+    image: systemx:latest
+    environment:
+      SYSTEMX_HOST: 0.0.0.0
+      SYSTEMX_PORT: 8080
+      SYSTEMX_LOG_LEVEL: info
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    # Uncomment to provide a .env file instead of inline env vars
+    # env_file:
+    #   - .env
+
+  # Example child PBX pointed back at the main router.
+  # To enable, uncomment and adjust env vars / routes as required.
+  # child-pbx:
+  #   build: .
+  #   image: systemx:latest
+  #   environment:
+  #     SYSTEMX_HOST: 0.0.0.0
+  #     SYSTEMX_PORT: 8081
+  #     SYSTEMX_LOG_LEVEL: info
+  #   ports:
+  #     - "8081:8081"
+  #   restart: unless-stopped
