@@ -43,6 +43,15 @@ type BroadcastSession = {
   metadata?: Record<string, unknown>;
 };
 
+type PBXRegistration = {
+  domain: string;
+  routes: string[];
+  endpoint?: string;
+  auth?: string;
+  connection: ConnectionContext;
+  compiledRoutes: RegExp[];
+};
+
 export class SystemXRouter {
   private readonly connections = new ConnectionRegistry();
   private readonly calls = new CallManager();
@@ -58,6 +67,9 @@ export class SystemXRouter {
   private readonly pendingWakeCallsById = new Map<string, PendingWakeCall>();
   private readonly broadcastSessionsByAddress = new Map<string, BroadcastSession>();
   private readonly broadcastSessionsByCallId = new Map<string, BroadcastSession>();
+  private readonly forwardedCalls = new Map<string, { caller: ConnectionContext; pbx: ConnectionContext; target: string }>();
+  private readonly pbxByConnection = new Map<string, PBXRegistration>();
+  private readonly pbxRoutes: PBXRegistration[] = [];
 
   constructor(private readonly options: RouterOptions) {
     if (!options) {
@@ -105,6 +117,18 @@ export class SystemXRouter {
         break;
       case "SLEEP_ACK":
         this.handleSleepAck(connection, message);
+        break;
+      case "REGISTER_PBX":
+        this.handleRegisterPBX(connection, message);
+        break;
+      case "DIAL_FORWARD":
+        this.handleDialForward(connection, message);
+        break;
+      case "RING":
+        this.handleInboundRing(connection, message);
+        break;
+      case "BUSY":
+        this.handleInboundBusy(connection, message as any);
         break;
       default:
         this.sendInvalidPayload(connection, "UNKNOWN", `Unsupported message type: ${String((message as any).type)}`);
@@ -317,6 +341,11 @@ export class SystemXRouter {
     }
     const callee = this.connections.getByAddress(message.to);
     if (!callee) {
+      const pbx = this.findPBXRoute(message.to);
+      if (pbx) {
+        this.forwardDialToPBX(caller, message, pbx);
+        return;
+      }
       if (this.tryWakeSleepingAgent(caller, message)) {
         return;
       }
@@ -419,7 +448,9 @@ export class SystemXRouter {
     callee: ConnectionContext;
     metadata?: Record<string, unknown>;
     callId?: string;
+    sendRing?: boolean;
   }) {
+    const sendRing = params.sendRing !== false;
     const call = this.calls.createCall({
       caller: params.caller,
       callee: params.callee,
@@ -437,12 +468,14 @@ export class SystemXRouter {
     });
     this.scheduleCallTimeout(call.callId);
 
-    params.callee.transport.send({
-      type: "RING",
-      from: params.caller.address,
-      call_id: call.callId,
-      metadata: params.metadata,
-    });
+    if (sendRing) {
+      params.callee.transport.send({
+        type: "RING",
+        from: params.caller.address,
+        call_id: call.callId,
+        metadata: params.metadata,
+      });
+    }
 
     return call;
   }
@@ -928,6 +961,230 @@ export class SystemXRouter {
     }
   }
 
+  private findPBXRoute(address: string): PBXRegistration | null {
+    for (const registration of this.pbxRoutes) {
+      for (const pattern of registration.compiledRoutes) {
+        if (pattern.test(address)) {
+          return registration;
+        }
+      }
+    }
+    return null;
+  }
+
+  private forwardDialToPBX(caller: ConnectionContext, message: DialMessage, registration: PBXRegistration) {
+    if (!caller.address) {
+      return;
+    }
+    const call = this.startCall({
+      caller,
+      callee: registration.connection,
+      metadata: message.metadata,
+      sendRing: false,
+    });
+    this.forwardedCalls.set(call.callId, {
+      caller,
+      pbx: registration.connection,
+      target: message.to,
+    });
+    registration.connection.transport.send({
+      type: "DIAL_FORWARD",
+      call_id: call.callId,
+      from: caller.address,
+      to: message.to,
+      metadata: message.metadata,
+    });
+    this.logger.info("Forwarded dial to PBX", {
+      callId: call.callId,
+      to: message.to,
+      pbxDomain: registration.domain,
+    });
+  }
+
+  private handleRegisterPBX(connection: ConnectionContext, message: RegisterPBXMessage) {
+    if (typeof message.domain !== "string" || message.domain.length === 0) {
+      this.sendInvalidPayload(connection, "REGISTER_PBX", "Field 'domain' must be a non-empty string");
+      return;
+    }
+    if (!Array.isArray(message.routes) || message.routes.length === 0) {
+      this.sendInvalidPayload(connection, "REGISTER_PBX", "Field 'routes' must be a non-empty array");
+      return;
+    }
+    const compiledRoutes: RegExp[] = [];
+    for (const route of message.routes) {
+      if (typeof route !== "string" || route.length === 0) {
+        this.sendInvalidPayload(connection, "REGISTER_PBX", "Route entries must be non-empty strings");
+        return;
+      }
+      compiledRoutes.push(this.compileRoutePattern(route));
+    }
+
+    const existing = this.pbxByConnection.get(connection.sessionId);
+    if (existing) {
+      this.removePBXRegistration(existing);
+    }
+
+    const registration: PBXRegistration = {
+      domain: message.domain,
+      routes: message.routes,
+      endpoint: message.endpoint,
+      auth: message.auth,
+      connection,
+      compiledRoutes,
+    };
+    this.pbxByConnection.set(connection.sessionId, registration);
+    this.pbxRoutes.push(registration);
+
+    if (!connection.address) {
+      connection.address = `pbx:${message.domain}`;
+    }
+
+    connection.transport.send({
+      type: "REGISTERED_PBX",
+      domain: message.domain,
+    });
+
+    this.logger.info("PBX registered", {
+      domain: message.domain,
+      routes: message.routes,
+      sessionId: connection.sessionId,
+    });
+  }
+
+  private handleDialForward(connection: ConnectionContext, message: DialForwardMessage) {
+    const registration = this.pbxByConnection.get(connection.sessionId);
+    if (!registration) {
+      this.sendInvalidPayload(connection, "DIAL_FORWARD", "PBX must register before forwarding calls");
+      return;
+    }
+    const callee = this.connections.getByAddress(message.to);
+    if (!callee) {
+      connection.transport.send({
+        type: "BUSY",
+        call_id: message.call_id,
+        to: message.to,
+        reason: "no_such_address",
+      });
+      return;
+    }
+    if (callee.concurrency === "single" && this.hasActiveCall(callee)) {
+      connection.transport.send({
+        type: "BUSY",
+        call_id: message.call_id,
+        to: message.to,
+        reason: "already_in_call",
+      });
+      return;
+    }
+    if (callee.concurrency === "parallel" && callee.maxSessions !== undefined && callee.activeCallIds.size >= callee.maxSessions) {
+      connection.transport.send({
+        type: "BUSY",
+        call_id: message.call_id,
+        to: message.to,
+        reason: "max_sessions_reached",
+      });
+      return;
+    }
+    if (callee.concurrency === "broadcast") {
+      connection.transport.send({
+        type: "BUSY",
+        call_id: message.call_id,
+        to: message.to,
+        reason: "unsupported",
+      });
+      return;
+    }
+
+    const call = this.startCall({
+      caller: connection,
+      callee,
+      metadata: message.metadata,
+      callId: message.call_id,
+    });
+
+    connection.transport.send({
+      type: "RING",
+      call_id: message.call_id,
+      from: callee.address,
+      metadata: message.metadata,
+    });
+
+    this.logger.info("PBX dial forward accepted", {
+      callId: message.call_id,
+      to: message.to,
+    });
+  }
+
+  private handleInboundRing(connection: ConnectionContext, message: RingMessage) {
+    const bridging = this.forwardedCalls.get(message.call_id);
+    if (!bridging || bridging.pbx !== connection) {
+      return;
+    }
+    bridging.caller.transport.send({
+      type: "RING",
+      call_id: message.call_id,
+      from: message.from ?? bridging.target,
+      metadata: message.metadata,
+    });
+  }
+
+  private handleInboundBusy(connection: ConnectionContext, message: any) {
+    const callId = typeof message.call_id === "string" ? message.call_id : undefined;
+    if (!callId) {
+      return;
+    }
+    const bridging = this.forwardedCalls.get(callId);
+    if (!bridging || bridging.pbx !== connection) {
+      return;
+    }
+    bridging.caller.transport.send({
+      type: "BUSY",
+      to: bridging.target,
+      reason: message.reason ?? "unavailable",
+    });
+    this.endForwardedCall(callId, message.reason ?? "unavailable");
+  }
+
+  private compileRoutePattern(pattern: string): RegExp {
+    const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = `^${escaped.replace(/\\\*/g, ".*")}$`;
+    return new RegExp(regex, "i");
+  }
+
+  private removePBXRegistration(registration: PBXRegistration) {
+    this.pbxByConnection.delete(registration.connection.sessionId);
+    const index = this.pbxRoutes.indexOf(registration);
+    if (index >= 0) {
+      this.pbxRoutes.splice(index, 1);
+    }
+    this.forwardedCalls.forEach((value, callId) => {
+      if (value.pbx === registration.connection) {
+        this.endForwardedCall(callId, "pbx_disconnected");
+      }
+    });
+  }
+
+  private endForwardedCall(callId: string, reason: string) {
+    const call = this.calls.getCall(callId);
+    if (call) {
+      this.calls.endCall(callId, reason);
+      this.clearCallState(call);
+    } else {
+      const bridging = this.forwardedCalls.get(callId);
+      if (bridging) {
+        this.forwardedCalls.delete(callId);
+        this.removeActiveCall(bridging.caller, callId);
+        if (!this.hasActiveCall(bridging.caller)) {
+          bridging.caller.status = "available";
+        }
+        this.removeActiveCall(bridging.pbx, callId);
+        if (!this.hasActiveCall(bridging.pbx)) {
+          bridging.pbx.status = "available";
+        }
+      }
+    }
+  }
+
   private resumePendingWakeCalls(callee: ConnectionContext) {
     if (!callee.address) {
       return;
@@ -1207,6 +1464,7 @@ export class SystemXRouter {
       }
       this.resetSleepTimer(call.callee);
     }
+    this.forwardedCalls.delete(call.callId);
     if (call.callee.address) {
       this.resumePendingWakeCalls(call.callee);
     }
@@ -1217,6 +1475,10 @@ export class SystemXRouter {
     this.clearSleepTimer(connection);
     if (reason === "timeout" && connection.wakeMode === "wake_on_ring" && connection.wakeHandler && connection.address) {
       this.storeWakeProfile(connection);
+    }
+    const registration = this.pbxByConnection.get(connection.sessionId);
+    if (registration) {
+      this.removePBXRegistration(registration);
     }
     this.connections.disconnect(connection);
     this.dialCounters.delete(connection.sessionId);

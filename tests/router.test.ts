@@ -848,3 +848,135 @@ describe("SystemXRouter broadcast routing", () => {
     expect(broadcasterHangups[broadcasterHangups.length - 1]).toMatchObject({ from: "listener1@example.com" });
   });
 });
+
+describe("SystemXRouter federation", () => {
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    router = new SystemXRouter(defaultOptions);
+  });
+
+  function registerPBX(router: SystemXRouter, connection: ReturnType<typeof createTestConnection>["connection"], routes: string[]) {
+    router.handleMessage(connection, {
+      type: "REGISTER_PBX",
+      domain: "child.test",
+      routes,
+    });
+  }
+
+  it("forwards calls to registered PBX and bridges responses", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@parent.test");
+
+    const pbx = createTestConnection(router);
+    registerPBX(router, pbx.connection, ["*@child.test"]);
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "agent@child.test",
+    });
+
+    const forward = pbx.transport.getMessagesOfType("DIAL_FORWARD");
+    expect(forward).toHaveLength(1);
+    const callId = forward[0].call_id as string;
+
+    router.handleMessage(pbx.connection, {
+      type: "RING",
+      call_id: callId,
+      from: "agent@child.test",
+    });
+    const ring = caller.transport.getMessagesOfType("RING");
+    expect(ring).toHaveLength(1);
+
+    router.handleMessage(pbx.connection, {
+      type: "ANSWER",
+      call_id: callId,
+    });
+    const connected = caller.transport.getMessagesOfType("CONNECTED");
+    expect(connected).toHaveLength(1);
+
+    router.handleMessage(caller.connection, {
+      type: "MSG",
+      call_id: callId,
+      data: "hello downstream",
+    });
+    const pbxMessages = pbx.transport.getMessagesOfType("MSG");
+    expect(pbxMessages[pbxMessages.length - 1]).toMatchObject({ data: "hello downstream" });
+
+    router.handleMessage(pbx.connection, {
+      type: "HANGUP",
+      call_id: callId,
+      reason: "normal",
+    });
+    const callerHangups = caller.transport.getMessagesOfType("HANGUP");
+    expect(callerHangups[callerHangups.length - 1]).toMatchObject({ call_id: callId });
+  });
+
+  it("returns busy to caller when downstream PBX rejects call", () => {
+    const caller = createTestConnection(router);
+    registerAddress(router, caller.connection, "caller@parent.test");
+
+    const pbx = createTestConnection(router);
+    registerPBX(router, pbx.connection, ["*@child.test"]);
+
+    router.handleMessage(caller.connection, {
+      type: "DIAL",
+      to: "agent@child.test",
+    });
+
+    const forward = pbx.transport.getMessagesOfType("DIAL_FORWARD");
+    const callId = forward[0].call_id as string;
+
+    router.handleMessage(pbx.connection, {
+      type: "BUSY",
+      call_id: callId,
+      reason: "no_agent",
+    });
+
+    const busyMessages = caller.transport.getMessagesOfType("BUSY");
+    expect(busyMessages).toHaveLength(1);
+    expect(busyMessages[0]).toMatchObject({ reason: "no_agent" });
+  });
+
+  it("handles DIAL_FORWARD by ringing local callee and notifying parent", () => {
+    const pbx = createTestConnection(router);
+    registerPBX(router, pbx.connection, ["*.child.test"]);
+
+    const callee = createTestConnection(router);
+    registerAddress(router, callee.connection, "agent@child.test");
+
+    router.handleMessage(pbx.connection, {
+      type: "DIAL_FORWARD",
+      call_id: "forward-1",
+      from: "caller@parent.test",
+      to: "agent@child.test",
+    });
+
+    const ringMessages = callee.transport.getMessagesOfType("RING");
+    expect(ringMessages).toHaveLength(1);
+
+    router.handleMessage(callee.connection, {
+      type: "ANSWER",
+      call_id: "forward-1",
+    });
+
+    const connected = pbx.transport.getMessagesOfType("CONNECTED");
+    expect(connected[connected.length - 1]).toMatchObject({ call_id: "forward-1" });
+
+    router.handleMessage(callee.connection, {
+      type: "MSG",
+      call_id: "forward-1",
+      data: "hello parent",
+    });
+    const parentMsgs = pbx.transport.getMessagesOfType("MSG");
+    expect(parentMsgs[parentMsgs.length - 1]).toMatchObject({ data: "hello parent" });
+
+    router.handleMessage(pbx.connection, {
+      type: "HANGUP",
+      call_id: "forward-1",
+      reason: "normal",
+    });
+    const calleeHangups = callee.transport.getMessagesOfType("HANGUP");
+    expect(calleeHangups[calleeHangups.length - 1]).toMatchObject({ call_id: "forward-1" });
+  });
+});

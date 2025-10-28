@@ -73,6 +73,13 @@ export type MsgMessage = {
   content_type?: "text" | "json" | "binary";
 };
 
+export type RingMessage = {
+  type: "RING";
+  call_id: string;
+  from?: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type PresenceQuery = {
   domain?: string;
   capabilities?: string[];
@@ -92,6 +99,22 @@ export type SleepAckMessage = {
   type: "SLEEP_ACK";
 };
 
+export type RegisterPBXMessage = {
+  type: "REGISTER_PBX";
+  domain: string;
+  routes: string[];
+  endpoint?: string;
+  auth?: string;
+};
+
+export type DialForwardMessage = {
+  type: "DIAL_FORWARD";
+  call_id: string;
+  from: string;
+  to: string;
+  metadata?: Record<string, unknown>;
+};
+
 export type RouterInboundMessage =
   | RegisterMessage
   | StatusMessage
@@ -101,8 +124,11 @@ export type RouterInboundMessage =
   | AnswerMessage
   | HangupMessage
   | MsgMessage
+  | RingMessage
   | PresenceMessage
   | SleepAckMessage
+  | RegisterPBXMessage
+  | DialForwardMessage
   | Record<string, unknown>;
 
 export type RegisterFailureReason = "address_in_use" | "invalid_address" | "auth_failed";
