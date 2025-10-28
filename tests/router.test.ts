@@ -50,10 +50,16 @@ function createTestConnection(router: SystemXRouter) {
   return { transport, connection };
 }
 
-function registerAddress(router: SystemXRouter, connection: ReturnType<typeof createTestConnection>["connection"], address: string) {
+function registerAddress(
+  router: SystemXRouter,
+  connection: ReturnType<typeof createTestConnection>["connection"],
+  address: string,
+  metadata?: Record<string, unknown>,
+) {
   router.handleMessage(connection, {
     type: "REGISTER",
     address,
+    metadata,
   });
 }
 
@@ -461,6 +467,95 @@ describe("SystemXRouter validation", () => {
       type: "ERROR",
       reason: "rate_limited",
       context: "DIAL",
+    });
+  });
+});
+
+describe("SystemXRouter presence", () => {
+  let router: SystemXRouter;
+
+  beforeEach(() => {
+    router = new SystemXRouter(defaultOptions);
+  });
+
+  it("returns presence results filtered by domain and capabilities", () => {
+    const requester = createTestConnection(router);
+    registerAddress(router, requester.connection, "requester@example.com", {
+      capabilities: ["chat"],
+    });
+
+    const alice = createTestConnection(router);
+    registerAddress(router, alice.connection, "alice@example.com", {
+      capabilities: ["chat", "code"],
+    });
+    const bob = createTestConnection(router);
+    registerAddress(router, bob.connection, "bob@other.com", {
+      capabilities: ["chat"],
+    });
+
+    router.handleMessage(requester.connection, {
+      type: "PRESENCE",
+      query: {
+        domain: "example.com",
+        capabilities: ["chat"],
+      },
+    });
+
+    const results = requester.transport.getMessagesOfType("PRESENCE_RESULT");
+    expect(results).toHaveLength(1);
+    expect(results[0].addresses).toEqual([
+      {
+        address: "alice@example.com",
+        status: "available",
+        metadata: { capabilities: ["chat", "code"] },
+      },
+    ]);
+  });
+
+  it("supports proximity filtering using metadata location", () => {
+    const requester = createTestConnection(router);
+    registerAddress(router, requester.connection, "requester@example.com");
+
+    const near = createTestConnection(router);
+    registerAddress(router, near.connection, "near@example.com", {
+      location: { lat: 53.7, lon: -1.8 },
+    });
+    const far = createTestConnection(router);
+    registerAddress(router, far.connection, "far@example.com", {
+      location: { lat: 40.71, lon: -74.0 },
+    });
+
+    router.handleMessage(requester.connection, {
+      type: "PRESENCE",
+      query: {
+        near: { lat: 53.7, lon: -1.8, radius_km: 5 },
+      },
+    });
+
+    const results = requester.transport.getMessagesOfType("PRESENCE_RESULT");
+    expect(results).toHaveLength(1);
+    expect(results[0].addresses).toEqual([
+      {
+        address: "near@example.com",
+        status: "available",
+        metadata: { location: { lat: 53.7, lon: -1.8 } },
+      },
+    ]);
+  });
+
+  it("rejects presence queries before registration", () => {
+    const { transport, connection } = createTestConnection(router);
+
+    router.handleMessage(connection, {
+      type: "PRESENCE",
+    });
+
+    const errors = transport.getMessagesOfType("ERROR");
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      type: "ERROR",
+      reason: "not_registered",
+      context: "PRESENCE",
     });
   });
 });

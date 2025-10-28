@@ -50,6 +50,21 @@ export type MsgMessage = {
   content_type?: "text" | "json" | "binary";
 };
 
+export type PresenceQuery = {
+  domain?: string;
+  capabilities?: string[];
+  near?: {
+    lat: number;
+    lon: number;
+    radius_km: number;
+  };
+};
+
+export type PresenceMessage = {
+  type: "PRESENCE";
+  query?: PresenceQuery;
+};
+
 export type RouterInboundMessage =
   | RegisterMessage
   | StatusMessage
@@ -59,6 +74,7 @@ export type RouterInboundMessage =
   | AnswerMessage
   | HangupMessage
   | MsgMessage
+  | PresenceMessage
   | Record<string, unknown>;
 
 export type RegisterFailureReason = "address_in_use" | "invalid_address" | "auth_failed";

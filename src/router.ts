@@ -4,6 +4,8 @@ import {
   HeartbeatMessage,
   HangupMessage,
   MsgMessage,
+  PresenceMessage,
+  PresenceQuery,
   PresenceStatus,
   RegisterMessage,
   RouterInboundMessage,
@@ -67,6 +69,9 @@ export class SystemXRouter {
         break;
       case "MSG":
         this.handleMsg(connection, message);
+        break;
+      case "PRESENCE":
+        this.handlePresence(connection, message);
         break;
       default:
         this.sendInvalidPayload(connection, "UNKNOWN", `Unsupported message type: ${String((message as any).type)}`);
@@ -372,6 +377,122 @@ export class SystemXRouter {
     });
   }
 
+  private handlePresence(connection: ConnectionContext, message: PresenceMessage) {
+    if (!connection.address) {
+      this.sendError(connection, "not_registered", "PRESENCE", "Registration is required before requesting presence");
+      return;
+    }
+
+    const query = message.query ?? {};
+    if (query.domain !== undefined && typeof query.domain !== "string") {
+      this.sendInvalidPayload(connection, "PRESENCE", "Field 'domain' must be a string");
+      return;
+    }
+    if (query.capabilities !== undefined) {
+      if (!Array.isArray(query.capabilities)) {
+        this.sendInvalidPayload(connection, "PRESENCE", "Field 'capabilities' must be an array");
+        return;
+      }
+      if (query.capabilities.some((cap) => typeof cap !== "string")) {
+        this.sendInvalidPayload(connection, "PRESENCE", "Capabilities must be strings");
+        return;
+      }
+    }
+    if (query.near) {
+      const { lat, lon, radius_km } = query.near;
+      if (
+        typeof lat !== "number" ||
+        typeof lon !== "number" ||
+        typeof radius_km !== "number" ||
+        radius_km < 0
+      ) {
+        this.sendInvalidPayload(connection, "PRESENCE", "Invalid near filter");
+        return;
+      }
+    }
+
+    const results: Array<{ address: string; status: PresenceStatus; metadata: Record<string, unknown> }> = [];
+    for (const other of this.connections.getAllConnections()) {
+      if (!other.address) {
+        continue;
+      }
+      if (other === connection) {
+        continue;
+      }
+      if (!this.matchesPresenceQuery(other, query)) {
+        continue;
+      }
+      results.push({
+        address: other.address,
+        status: other.status,
+        metadata: (other.metadata as Record<string, unknown>) ?? {},
+      });
+    }
+
+    connection.transport.send({
+      type: "PRESENCE_RESULT",
+      addresses: results,
+    });
+  }
+
+  private matchesPresenceQuery(connection: ConnectionContext, query: PresenceQuery): boolean {
+    if (!connection.address) {
+      return false;
+    }
+    if (query.domain) {
+      const domainPart = connection.address.split("@")[1];
+      if (!domainPart || domainPart.toLowerCase() !== query.domain.toLowerCase()) {
+        return false;
+      }
+    }
+    if (query.capabilities) {
+      const candidateCaps = Array.isArray((connection.metadata as any)?.capabilities)
+        ? ((connection.metadata as any).capabilities as unknown[])
+        : [];
+      const stringCaps = candidateCaps.filter((item): item is string => typeof item === "string");
+      for (const required of query.capabilities) {
+        if (!stringCaps.includes(required)) {
+          return false;
+        }
+      }
+    }
+    if (query.near) {
+      const location = this.extractLocation(connection.metadata);
+      if (!location) {
+        return false;
+      }
+      const distance = this.haversineDistanceKm(query.near.lat, query.near.lon, location.lat, location.lon);
+      if (distance > query.near.radius_km) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private extractLocation(metadata: Record<string, unknown> | undefined): { lat: number; lon: number } | null {
+    const location = (metadata as any)?.location;
+    if (!location) {
+      return null;
+    }
+    const { lat, lon } = location as { lat?: unknown; lon?: unknown };
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      return null;
+    }
+    return { lat, lon };
+  }
+
+  private haversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const toRad = (deg: number) => (deg * Math.PI) / 180;
+    const R = 6371; // Earth radius km
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
   private sendInvalidPayload(connection: ConnectionContext, context: string, detail: string) {
     this.logger.warn("Invalid message payload", {
       context,
@@ -382,6 +503,22 @@ export class SystemXRouter {
     connection.transport.send({
       type: "ERROR",
       reason: "invalid_payload",
+      context,
+      detail,
+    });
+  }
+
+  private sendError(connection: ConnectionContext, reason: string, context: string, detail: string) {
+    this.logger.warn("Request rejected", {
+      reason,
+      context,
+      detail,
+      address: connection.address,
+      sessionId: connection.sessionId,
+    });
+    connection.transport.send({
+      type: "ERROR",
+      reason,
       context,
       detail,
     });
