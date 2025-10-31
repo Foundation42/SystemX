@@ -62,6 +62,15 @@ export class LogStreamService {
 
   private handleMessage(message: Record<string, unknown>) {
     switch (message.type) {
+      case "HEARTBEAT":
+        // Respond to heartbeat to keep connection alive
+        if (this.connection) {
+          this.router.handleMessage(this.connection, {
+            type: "HEARTBEAT",
+          });
+        }
+        break;
+
       case "REGISTERED":
         this.logger.debug("Log service registered in broadcast mode");
         break;
