@@ -498,11 +498,25 @@ export class SystemXRouter {
     }
     this.calls.setConnected(call.callId);
     this.clearCallTimer(call.callId);
-    call.caller.transport.send({
-      type: "CONNECTED",
-      call_id: call.callId,
-      to: call.callee.address,
-    });
+    const bridging = this.forwardedCalls.get(call.callId);
+    if (this.pbxByConnection.has(call.caller.sessionId)) {
+      this.logger.debug("Forwarding ANSWER upstream via PBX", {
+        callId: call.callId,
+        pbxSession: call.caller.sessionId,
+        callee: call.callee.address,
+      });
+      call.caller.transport.send({
+        type: "ANSWER",
+        call_id: call.callId,
+        from: call.callee.address,
+      });
+    } else {
+      call.caller.transport.send({
+        type: "CONNECTED",
+        call_id: call.callId,
+        to: bridging?.target ?? call.callee.address,
+      });
+    }
     this.logger.info("Call connected", {
       callId: call.callId,
       caller: call.caller.address,
@@ -602,16 +616,20 @@ export class SystemXRouter {
       return;
     }
     const otherParty = connection === call.caller ? call.callee : call.caller;
+    const senderAddress =
+      this.pbxByConnection.has(connection.sessionId) && typeof message.from === "string"
+        ? message.from
+        : connection.address;
     otherParty.transport.send({
       type: "MSG",
       call_id: call.callId,
-      from: connection.address,
+      from: senderAddress,
       data: message.data,
       content_type: message.content_type ?? "text",
     });
     this.logger.debug("Message forwarded", {
       callId: call.callId,
-      from: connection.address,
+      from: senderAddress,
       to: otherParty.address,
     });
   }
@@ -1100,6 +1118,14 @@ export class SystemXRouter {
       callee,
       metadata: message.metadata,
       callId: message.call_id,
+      sendRing: false,
+    });
+
+    callee.transport.send({
+      type: "RING",
+      call_id: message.call_id,
+      from: message.from ?? connection.address,
+      metadata: message.metadata,
     });
 
     connection.transport.send({

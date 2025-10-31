@@ -5,6 +5,7 @@ type CliOptions = {
   dial?: string;
   autoAnswer: boolean;
   message?: string;
+  runSeconds?: number;
 };
 
 type InboundMessage = Record<string, any> & { type: string };
@@ -43,6 +44,16 @@ function parseArgs(argv: string[]): CliOptions {
           i += 1;
         }
         break;
+      case "--run-seconds":
+        if (value) {
+          const parsed = Number.parseFloat(value);
+          if (!Number.isFinite(parsed) || parsed <= 0) {
+            throw new Error(`Invalid --run-seconds value: ${value}`);
+          }
+          options.runSeconds = parsed;
+          i += 1;
+        }
+        break;
       default:
         break;
     }
@@ -59,6 +70,7 @@ const socket = new WebSocket(serverUrl);
 let activeCallId: string | null = null;
 let peerAddress: string | null = null;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
 function send(payload: Record<string, unknown>) {
   socket.send(JSON.stringify(payload));
@@ -88,6 +100,12 @@ socket.addEventListener("open", () => {
     },
   });
   scheduleHeartbeat();
+  if (options.runSeconds !== undefined) {
+    shutdownTimer = setTimeout(() => {
+      console.log(`Auto shutdown after ${options.runSeconds} seconds`);
+      shutdown();
+    }, Math.max(options.runSeconds * 1000, 0));
+  }
 });
 
 socket.addEventListener("message", (event) => {
@@ -182,6 +200,10 @@ process.stdin.on("data", (chunk) => {
 
 function shutdown() {
   clearHeartbeat();
+  if (shutdownTimer) {
+    clearTimeout(shutdownTimer);
+    shutdownTimer = null;
+  }
   if (socket.readyState === WebSocket.OPEN) {
     if (activeCallId) {
       send({ type: "HANGUP", call_id: activeCallId });

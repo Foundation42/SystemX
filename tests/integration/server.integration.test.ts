@@ -1,50 +1,24 @@
 import { describe, beforeAll, afterAll, it, expect } from "bun:test";
 import { IntegrationClient } from "./testClient";
+import { startServer as startSystemXServer, stopServer as stopSystemXServer, type ServerHandle } from "./serverUtils";
 
 const TEST_PORT = 18080;
-const SERVER_URL = `ws://127.0.0.1:${TEST_PORT}`;
 
-let serverProcess: Bun.Subprocess | null = null;
+let serverHandle: ServerHandle | null = null;
 
-async function waitForServerReady(url: string, timeoutMs = 5_000) {
-  const deadline = Date.now() + timeoutMs;
-  let lastError: unknown;
-
-  while (Date.now() < deadline) {
-    try {
-      await attemptConnection(url);
-      return;
-    } catch (error) {
-      lastError = error;
-      await Bun.sleep(100);
-    }
+function getServerUrl(): string {
+  if (!serverHandle) {
+    throw new Error("Server is not running");
   }
-
-  throw new Error(`Server did not become ready: ${lastError}`);
-}
-
-function attemptConnection(url: string) {
-  return new Promise<void>((resolve, reject) => {
-    const ws = new WebSocket(url);
-    const timer = setTimeout(() => {
-      ws.close();
-      reject(new Error("Timed out opening connection"));
-    }, 1_000);
-    ws.addEventListener("open", () => {
-      clearTimeout(timer);
-      ws.close();
-      resolve();
-    });
-    ws.addEventListener("error", (event) => {
-      clearTimeout(timer);
-      reject(event);
-    });
-  });
+  return serverHandle.url;
 }
 
 async function createRegisteredClient(address: string) {
+  if (!serverHandle) {
+    throw new Error("Server is not running");
+  }
   const client = new IntegrationClient(
-    new WebSocket(SERVER_URL),
+    new WebSocket(serverHandle.url),
     () => {
       // no-op
     },
@@ -57,27 +31,15 @@ async function createRegisteredClient(address: string) {
 }
 
 async function startServer(envOverrides: Record<string, string> = {}) {
-  serverProcess = Bun.spawn({
-    cmd: ["bun", "run", "src/server.ts"],
-    stdout: "pipe",
-    stderr: "pipe",
-    env: {
-      ...process.env,
-      SYSTEMX_PORT: String(TEST_PORT),
-      SYSTEMX_HOST: "127.0.0.1",
-      SYSTEMX_LOG_LEVEL: "error",
-      ...envOverrides,
-    },
+  serverHandle = await startSystemXServer({
+    port: TEST_PORT,
+    env: envOverrides,
   });
-
-  await waitForServerReady(SERVER_URL);
 }
 
 async function stopServer() {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+  await stopSystemXServer(serverHandle);
+  serverHandle = null;
 }
 
 describe("SystemX router integration", () => {
@@ -194,7 +156,7 @@ describe("SystemX router integration", () => {
   });
 
   it("closes connection on malformed JSON", async () => {
-    const rawSocket = new WebSocket(SERVER_URL);
+    const rawSocket = new WebSocket(getServerUrl());
     await new Promise<void>((resolve, reject) => {
       rawSocket.addEventListener("open", () => resolve(), { once: true });
       rawSocket.addEventListener("error", (err) => reject(err), { once: true });

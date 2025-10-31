@@ -6,6 +6,7 @@ import type { RouterInboundMessage } from "./types";
 import type { ConnectionContext, MessageTransport } from "./connection";
 import type { ServerWebSocket } from "bun";
 import { createWakeExecutor } from "./wake";
+import { createFederationManager, loadFederationConfig } from "./federation/manager";
 
 type SocketData = {
   connection: ConnectionContext | null;
@@ -180,6 +181,12 @@ logger.info("SystemX server ready", {
   tls: tlsEnabled,
 });
 
+const federationConfig = loadFederationConfig(logger);
+const federationManager = federationConfig ? createFederationManager(router, logger, federationConfig) : null;
+if (federationManager) {
+  federationManager.start();
+}
+
 const pruneIntervalMs = Math.max(heartbeatIntervalMs, 5_000);
 const pruneTimer = setInterval(() => {
   router.pruneStaleConnections();
@@ -188,6 +195,7 @@ const pruneTimer = setInterval(() => {
 const shutdown = (signal: string) => {
   logger.info("Shutting down SystemX server", { signal });
   clearInterval(pruneTimer);
+  federationManager?.stop();
   server.stop();
   process.exit(0);
 };

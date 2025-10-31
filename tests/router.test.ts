@@ -960,8 +960,8 @@ describe("SystemXRouter federation", () => {
       call_id: "forward-1",
     });
 
-    const connected = pbx.transport.getMessagesOfType("CONNECTED");
-    expect(connected[connected.length - 1]).toMatchObject({ call_id: "forward-1" });
+    const answered = pbx.transport.getMessagesOfType("ANSWER");
+    expect(answered[answered.length - 1]).toMatchObject({ call_id: "forward-1" });
 
     router.handleMessage(callee.connection, {
       type: "MSG",
