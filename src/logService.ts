@@ -62,6 +62,20 @@ export class LogStreamService {
       },
     });
 
+    // Send periodic heartbeats to keep connection alive
+    setInterval(() => {
+      if (this.connection) {
+        this.broadcasting = true;
+        try {
+          this.router.handleMessage(this.connection, {
+            type: "HEARTBEAT",
+          });
+        } finally {
+          this.broadcasting = false;
+        }
+      }
+    }, 15000);
+
     // Wrap logger to capture logs
     this.wrapLogger();
 
@@ -73,20 +87,6 @@ export class LogStreamService {
 
   private handleMessage(message: Record<string, unknown>) {
     switch (message.type) {
-      case "HEARTBEAT":
-        // Respond to heartbeat to keep connection alive
-        if (this.connection) {
-          this.broadcasting = true;
-          try {
-            this.router.handleMessage(this.connection, {
-              type: "HEARTBEAT",
-            });
-          } finally {
-            this.broadcasting = false;
-          }
-        }
-        break;
-
       case "REGISTERED":
         this.unwrappedLogger.debug("Log service registered in broadcast mode");
         break;
