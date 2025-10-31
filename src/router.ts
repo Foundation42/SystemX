@@ -620,17 +620,15 @@ export class SystemXRouter {
     }
     const otherParty = connection === call.caller ? call.callee : call.caller;
     const bridging = this.forwardedCalls.get(call.callId);
-    if (this.pbxByConnection.has(connection.sessionId) && bridging?.origin === connection.address) {
+    const isPBX = this.pbxByConnection.has(connection.sessionId);
+    if (isPBX && bridging?.target && message.from === bridging.target) {
       this.logger.debug("Suppressing loopback message", {
         callId: call.callId,
-        origin: bridging.origin,
+        origin: message.from,
       });
       return;
     }
-    const senderAddress =
-      this.pbxByConnection.has(connection.sessionId) && typeof message.from === "string"
-        ? message.from
-        : connection.address;
+    const senderAddress = isPBX && typeof message.from === "string" ? message.from : connection.address;
     otherParty.transport.send({
       type: "MSG",
       call_id: call.callId,
@@ -1086,6 +1084,21 @@ export class SystemXRouter {
     if (!registration) {
       this.sendInvalidPayload(connection, "DIAL_FORWARD", "PBX must register before forwarding calls");
       return;
+    }
+    const existingForward = this.forwardedCalls.get(message.call_id);
+    if (existingForward) {
+      existingForward.pbx = connection;
+      existingForward.target = message.to;
+      if (!existingForward.origin && typeof message.from === "string") {
+        existingForward.origin = message.from;
+      }
+    } else {
+      this.forwardedCalls.set(message.call_id, {
+        caller: connection,
+        pbx: connection,
+        target: message.to,
+        origin: typeof message.from === "string" ? message.from : undefined,
+      });
     }
     const callee = this.connections.getByAddress(message.to);
     if (!callee) {
