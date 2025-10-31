@@ -69,7 +69,7 @@ export class SystemXRouter {
   private readonly broadcastSessionsByCallId = new Map<string, BroadcastSession>();
   private readonly forwardedCalls = new Map<
     string,
-    { caller: ConnectionContext; pbx: ConnectionContext; target: string; origin?: string }
+    { caller: ConnectionContext; pbx: ConnectionContext; target: string; origin?: string; side: "parent" | "child" }
   >();
   private readonly pbxByConnection = new Map<string, PBXRegistration>();
   private readonly pbxRoutes: PBXRegistration[] = [];
@@ -621,14 +621,14 @@ export class SystemXRouter {
     const otherParty = connection === call.caller ? call.callee : call.caller;
     const bridging = this.forwardedCalls.get(call.callId);
     const isPBX = this.pbxByConnection.has(connection.sessionId);
-    if (isPBX && bridging?.target && message.from === bridging.target) {
+    const senderAddress = typeof message.from === "string" ? message.from : connection.address;
+    if (isPBX && bridging?.side === "parent" && bridging.origin && senderAddress === bridging.origin) {
       this.logger.debug("Suppressing loopback message", {
         callId: call.callId,
-        origin: message.from,
+        origin: bridging.origin,
       });
       return;
     }
-    const senderAddress = isPBX && typeof message.from === "string" ? message.from : connection.address;
     otherParty.transport.send({
       type: "MSG",
       call_id: call.callId,
@@ -1014,6 +1014,7 @@ export class SystemXRouter {
       pbx: registration.connection,
       target: message.to,
       origin: caller.address,
+      side: "parent",
     });
     registration.connection.transport.send({
       type: "DIAL_FORWARD",
@@ -1092,12 +1093,14 @@ export class SystemXRouter {
       if (!existingForward.origin && typeof message.from === "string") {
         existingForward.origin = message.from;
       }
+      existingForward.side = "child";
     } else {
       this.forwardedCalls.set(message.call_id, {
         caller: connection,
         pbx: connection,
         target: message.to,
         origin: typeof message.from === "string" ? message.from : undefined,
+        side: "child",
       });
     }
     const callee = this.connections.getByAddress(message.to);
@@ -1144,6 +1147,13 @@ export class SystemXRouter {
       metadata: message.metadata,
       callId: message.call_id,
       sendRing: false,
+    });
+    this.forwardedCalls.set(message.call_id, {
+      caller: connection,
+      pbx: connection,
+      target: message.to,
+      origin: typeof message.from === "string" ? message.from : undefined,
+      side: "child",
     });
 
     callee.transport.send({
