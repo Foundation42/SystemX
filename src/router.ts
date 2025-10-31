@@ -71,6 +71,7 @@ export class SystemXRouter {
     string,
     { caller: ConnectionContext; pbx: ConnectionContext; target: string; origin?: string; side: "parent" | "child" }
   >();
+  private readonly lastTargetMessage = new Map<string, { data: unknown; timestamp: number }>();
   private readonly pbxByConnection = new Map<string, PBXRegistration>();
   private readonly pbxRoutes: PBXRegistration[] = [];
 
@@ -622,12 +623,52 @@ export class SystemXRouter {
     const bridging = this.forwardedCalls.get(call.callId);
     const isPBX = this.pbxByConnection.has(connection.sessionId);
     const senderAddress = typeof message.from === "string" ? message.from : connection.address;
+
+    this.logger.debug("MSG received", {
+      callId: call.callId,
+      fromConnection: connection.address,
+      messageFrom: message.from,
+      senderAddress,
+      dataPreview: typeof message.data === "string" ? message.data.substring(0, 50) : "<binary>",
+      callStructure: `${call.caller.address} → ${call.callee.address}`,
+      isPBX,
+      bridgingSide: bridging?.side,
+      bridgingOrigin: bridging?.origin,
+      bridgingTarget: bridging?.target,
+      willForwardTo: otherParty.address,
+    });
+
+    // Parent-side loopback detection: suppress messages from child PBX claiming to be from origin
     if (isPBX && bridging?.side === "parent" && bridging.origin && senderAddress === bridging.origin) {
-      this.logger.debug("Suppressing loopback message", {
+      this.logger.debug("Suppressing parent-side loopback message", {
         callId: call.callId,
         origin: bridging.origin,
       });
       return;
+    }
+
+    // Child-side loopback detection: suppress messages from parent PBX that echo what target just sent
+    if (isPBX && bridging?.side === "child" && bridging.origin && senderAddress === bridging.origin) {
+      const lastMsg = this.lastTargetMessage.get(call.callId);
+      if (lastMsg && lastMsg.data === message.data) {
+        const age = Date.now() - lastMsg.timestamp;
+        if (age < 5000) { // Within 5 seconds
+          this.logger.debug("Suppressing child-side loopback message", {
+            callId: call.callId,
+            origin: bridging.origin,
+            age,
+          });
+          return;
+        }
+      }
+    }
+
+    // Track messages from target (non-PBX party) on child side for loop detection
+    if (bridging?.side === "child" && !isPBX && connection !== bridging.pbx) {
+      this.lastTargetMessage.set(call.callId, {
+        data: message.data,
+        timestamp: Date.now(),
+      });
     }
     otherParty.transport.send({
       type: "MSG",
@@ -1088,6 +1129,13 @@ export class SystemXRouter {
     }
     const existingForward = this.forwardedCalls.get(message.call_id);
     if (existingForward) {
+      this.logger.debug("Updating existing forward", {
+        callId: message.call_id,
+        from: message.from,
+        to: message.to,
+        existingOrigin: existingForward.origin,
+        existingSide: existingForward.side,
+      });
       existingForward.pbx = connection;
       existingForward.target = message.to;
       if (!existingForward.origin && typeof message.from === "string") {
@@ -1095,6 +1143,12 @@ export class SystemXRouter {
       }
       existingForward.side = "child";
     } else {
+      this.logger.debug("Creating new forward", {
+        callId: message.call_id,
+        from: message.from,
+        to: message.to,
+        origin: typeof message.from === "string" ? message.from : undefined,
+      });
       this.forwardedCalls.set(message.call_id, {
         caller: connection,
         pbx: connection,
@@ -1147,13 +1201,6 @@ export class SystemXRouter {
       metadata: message.metadata,
       callId: message.call_id,
       sendRing: false,
-    });
-    this.forwardedCalls.set(message.call_id, {
-      caller: connection,
-      pbx: connection,
-      target: message.to,
-      origin: typeof message.from === "string" ? message.from : undefined,
-      side: "child",
     });
 
     callee.transport.send({
@@ -1526,6 +1573,7 @@ export class SystemXRouter {
       this.resetSleepTimer(call.callee);
     }
     this.forwardedCalls.delete(call.callId);
+    this.lastTargetMessage.delete(call.callId);
     if (call.callee.address) {
       this.resumePendingWakeCalls(call.callee);
     }
