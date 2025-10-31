@@ -7,6 +7,7 @@ import type { ConnectionContext, MessageTransport } from "./connection";
 import type { ServerWebSocket } from "bun";
 import { createWakeExecutor } from "./wake";
 import { createFederationManager, loadFederationConfig } from "./federation/manager";
+import { LogStreamService } from "./logService";
 
 type SocketData = {
   connection: ConnectionContext | null;
@@ -181,6 +182,10 @@ logger.info("SystemX server ready", {
   tls: tlsEnabled,
 });
 
+// Start built-in log streaming service
+const logService = new LogStreamService(router, logger);
+logService.start();
+
 const federationConfig = loadFederationConfig(logger);
 const federationManager = federationConfig ? createFederationManager(router, logger, federationConfig) : null;
 if (federationManager) {
@@ -195,6 +200,7 @@ const pruneTimer = setInterval(() => {
 const shutdown = (signal: string) => {
   logger.info("Shutting down SystemX server", { signal });
   clearInterval(pruneTimer);
+  logService.stop();
   federationManager?.stop();
   server.stop();
   process.exit(0);
