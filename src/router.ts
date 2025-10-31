@@ -67,7 +67,10 @@ export class SystemXRouter {
   private readonly pendingWakeCallsById = new Map<string, PendingWakeCall>();
   private readonly broadcastSessionsByAddress = new Map<string, BroadcastSession>();
   private readonly broadcastSessionsByCallId = new Map<string, BroadcastSession>();
-  private readonly forwardedCalls = new Map<string, { caller: ConnectionContext; pbx: ConnectionContext; target: string }>();
+  private readonly forwardedCalls = new Map<
+    string,
+    { caller: ConnectionContext; pbx: ConnectionContext; target: string; origin?: string }
+  >();
   private readonly pbxByConnection = new Map<string, PBXRegistration>();
   private readonly pbxRoutes: PBXRegistration[] = [];
 
@@ -616,6 +619,14 @@ export class SystemXRouter {
       return;
     }
     const otherParty = connection === call.caller ? call.callee : call.caller;
+    const bridging = this.forwardedCalls.get(call.callId);
+    if (this.pbxByConnection.has(connection.sessionId) && bridging?.origin === connection.address) {
+      this.logger.debug("Suppressing loopback message", {
+        callId: call.callId,
+        origin: bridging.origin,
+      });
+      return;
+    }
     const senderAddress =
       this.pbxByConnection.has(connection.sessionId) && typeof message.from === "string"
         ? message.from
@@ -1004,6 +1015,7 @@ export class SystemXRouter {
       caller,
       pbx: registration.connection,
       target: message.to,
+      origin: caller.address,
     });
     registration.connection.transport.send({
       type: "DIAL_FORWARD",
