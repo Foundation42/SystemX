@@ -27,6 +27,9 @@ This metaphor scales from simple 1-on-1 calls to complex scenarios like broadcas
 ## Quick Start
 
 ```bash
+# Fetch transport dependency
+git submodule update --init --recursive
+
 # Install dependencies
 bun install
 

@@ -1,0 +1,4 @@
+[submodule "trimphone"]
+	path = trimphone
+	url = https://github.com/Foundation42/Trimphone.git
+	branch = main
