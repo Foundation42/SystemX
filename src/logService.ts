@@ -14,6 +14,7 @@ export class LogStreamService {
   private listenerCount = 0;
   private logBuffer: string[] = [];
   private originalLogger: Logger;
+  private broadcasting = false;
 
   constructor(router: SystemXRouter, logger: Logger) {
     this.router = router;
@@ -170,34 +171,44 @@ export class LogStreamService {
   }
 
   private broadcastLog(level: LogLevel, message: string, context?: Record<string, unknown>) {
-    // Format log with ANSI colors
-    const colorMap: Record<LogLevel, string> = {
-      debug: "\x1b[2m",      // dim
-      info: "\x1b[36m",       // cyan
-      warn: "\x1b[33m",       // yellow
-      error: "\x1b[31m",      // red
-    };
-
-    const color = colorMap[level];
-    const reset = "\x1b[0m";
-    const timestamp = new Date().toISOString();
-    const contextStr = context ? ` ${JSON.stringify(context)}` : "";
-    const logLine = `${color}[${level.toUpperCase()}]${reset} \x1b[2m${timestamp}\x1b[0m ${message}${contextStr}`;
-
-    // Add to buffer
-    this.logBuffer.push(logLine);
-    if (this.logBuffer.length > LOG_BUFFER_SIZE) {
-      this.logBuffer.shift();
+    // Prevent infinite recursion from logs generated during broadcasting
+    if (this.broadcasting) {
+      return;
     }
 
-    // Broadcast to listeners if any
-    if (this.callId && this.connection && this.listenerCount > 0) {
-      this.router.handleMessage(this.connection, {
-        type: "MSG",
-        call_id: this.callId,
-        data: logLine + "\n",
-        content_type: "text",
-      });
+    this.broadcasting = true;
+    try {
+      // Format log with ANSI colors
+      const colorMap: Record<LogLevel, string> = {
+        debug: "\x1b[2m",      // dim
+        info: "\x1b[36m",       // cyan
+        warn: "\x1b[33m",       // yellow
+        error: "\x1b[31m",      // red
+      };
+
+      const color = colorMap[level];
+      const reset = "\x1b[0m";
+      const timestamp = new Date().toISOString();
+      const contextStr = context ? ` ${JSON.stringify(context)}` : "";
+      const logLine = `${color}[${level.toUpperCase()}]${reset} \x1b[2m${timestamp}\x1b[0m ${message}${contextStr}`;
+
+      // Add to buffer
+      this.logBuffer.push(logLine);
+      if (this.logBuffer.length > LOG_BUFFER_SIZE) {
+        this.logBuffer.shift();
+      }
+
+      // Broadcast to listeners if any
+      if (this.callId && this.connection && this.listenerCount > 0) {
+        this.router.handleMessage(this.connection, {
+          type: "MSG",
+          call_id: this.callId,
+          data: logLine + "\n",
+          content_type: "text",
+        });
+      }
+    } finally {
+      this.broadcasting = false;
     }
   }
 
